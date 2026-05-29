@@ -5,6 +5,201 @@ project adheres to [Semantic Versioning](http://semver.org/).
 
 ## Unreleased
 
+## 2.0.0
+
+This release replaces the Speakeasy-generated SDK code with a compact, bespoke client. The HTTP behavior against OPA is unchanged. The high-level `OpaClient` remains the recommended surface, with new optional constructor parameters for serializer choice, `HttpClient` injection, and bearer-token authentication.
+
+This is a major release because the surface area below `OpaClient` has been redesigned. The previous low-level `OpaApiClient` and the Speakeasy-emitted models, requests, and exceptions are no more. Most consumers of the high-level API will only need to update batch evaluation call sites and exception-catching code.
+
+### New features
+
+#### Pluggable JSON serializer
+
+`OpaClient` now accepts an `IOpaSerializer` on its constructor, and the SDK ships with two implementations: `NewtonsoftOpaSerializer` (the default, preserving backwards compatibility with the existing `JsonSerializerSettings` parameter) and `SystemTextJsonOpaSerializer` for projects that have standardized on `System.Text.Json`.
+
+```csharp
+using OpenPolicyAgent.Opa;
+using OpenPolicyAgent.Opa.Serialization;
+
+var opa = new OpaClient(
+    serverUrl: "http://localhost:8181",
+    serializer: new SystemTextJsonOpaSerializer());
+
+var allowed = await opa.Check("authz/allow", input);
+```
+
+> **Note**: `GetFilters` / `GetMultipleFilters` still require Newtonsoft for response parsing because `OpenPolicyAgent.Ucast.Linq` ships Newtonsoft-specific `JsonConverter`s on its filter types. Other operations work end-to-end under either serializer.
+
+#### Improved exception hierarchy
+
+The exceptions the library will use have been redesigned around a single base type, `OpaException`, plus four subtypes that distinguish the failure class. All exceptions carry fixed properties (`StatusCode`, `Code`, `DecisionId`, `RawBody`) so callers can branch on whatever level of detail fits their use case.
+
+| Subtype                     | Thrown for                                                                 |
+|-----------------------------|----------------------------------------------------------------------------|
+| `OpaTransportException`     | Network failures: DNS, connect, read timeout, TLS. `StatusCode` is null.   |
+| `OpaPolicyException`        | HTTP 4xx — malformed query, unknown path, batch endpoint not present.      |
+| `OpaServerException`        | HTTP 5xx — eval errors, internal errors. May carry `BatchQueryErrors`.       |
+| `OpaSerializationException` | Unexpected content type, malformed JSON, type-coercion failure on results. |
+
+```csharp
+try {
+    var allowed = await opa.Check("authz/allow", input);
+}
+catch (OpaServerException e) when (e.Code == "internal_error") {
+    // 5xx from the OPA server.
+}
+catch (OpaPolicyException e) {
+    // 4xx indicating the request itself is malformed.
+}
+catch (OpaTransportException) {
+    // Network problem reaching OPA.
+}
+```
+
+Catching the base `OpaException` still works for callers who just want catch everything.
+
+#### `EvaluateWithMetadataAsync<T>` for decision metadata
+
+For callers who need OPA's `decision_id`, query metrics, or bundle provenance alongside the policy result, there's a new method that returns an `OpaResult<T>` carrying the value plus the response metadata fields.
+
+```csharp
+OpaResult<bool> result = await opa.EvaluateWithMetadataAsync<bool>(
+    "authz/allow",
+    input,
+    provenance: true,
+    metrics: false);
+
+logger.LogInformation(
+    "decision {DecisionId} on bundle {Version} = {Allow}",
+    result.DecisionId,
+    result.Provenance?.Version,
+    result.Value);
+```
+
+The simpler `Evaluate<T>` variants still returns just `T` and remains the recommended choice when metadata isn't needed.
+
+#### `HttpClient` injection
+
+For full control over timeouts, custom `DelegatingHandler`s, mTLS, proxy configuration, or auth schemes other than bearer tokens, `OpaClient` now accepts a user-supplied `HttpClient`. When supplied, the SDK does not dispose of it — the caller owns its lifecycle.
+
+```csharp
+var handler = new SocketsHttpHandler {
+    PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+};
+using var http = new HttpClient(handler) {
+    Timeout = TimeSpan.FromSeconds(30),
+};
+
+var opa = new OpaClient(serverUrl: "https://opa.internal:8181", httpClient: http);
+```
+
+When no `HttpClient` is supplied, the SDK uses a shared default, matching the .NET idiom of long-lived `HttpClient` instances.
+
+#### Bearer-token rotation
+
+For servers that require a bearer token, pass a callback rather than a static string. The callback is invoked once per request, so rotating credentials work without rebuilding the client.
+
+```csharp
+var opa = new OpaClient(
+    serverUrl: "https://opa.internal:8181",
+    bearerTokenSource: () => tokenProvider.GetCurrentToken());
+```
+
+This feature replaces the previous Speakeasy-emitted `bearerAuth:` constructor parameter on the now-removed `OpaApiClient` type.
+
+### Breaking changes
+#### `EvaluateBatch<T>` type changes
+
+`EvaluateBatch` returned a tuple of two disjoint dictionaries (`OpaBatchResults`, `OpaBatchErrors`). Walking the result meant zipping the two halves and remembering which keys appeared in which side. The new shape is a single dictionary of discriminated entries:
+
+```csharp
+var inputs = new Dictionary<string, object?>() {
+    { "AAA", new Dictionary<string, object>() { { "subject", "alice" } } },
+    { "BBB", new Dictionary<string, object>() { { "subject", "bob"   } } },
+};
+
+Dictionary<string, OpaBatchEntry<bool>> results =
+    await opa.EvaluateBatch<bool>("authz/allow", inputs);
+
+foreach (var (key, entry) in results) {
+    if (entry.IsSuccess) Console.WriteLine($"{key}: {entry.Value}");
+    else                 Console.WriteLine($"{key} failed: {entry.Error!.Message}");
+}
+```
+
+Each `OpaBatchEntry<T>` carries `IsSuccess`, `Value`, `Error`, `StatusCode`, `DecisionId`, `Metrics`, `Provenance` fields. For callers who only want one side, the new `OpaBatchExtensions.Successes()` / `.Failures()` projections allow simulating the "two dictionaries" flow:
+
+```csharp
+IDictionary<string, bool>     successes = results.Successes();
+IDictionary<string, OpaError> failures  = results.Failures();
+```
+
+The non-generic `EvaluateBatch` overload is removed. The new signature requires passing a type argument (e.g. `EvaluateBatch<bool>`, `EvaluateBatch<Dictionary<string, object>>`, etc). The input parameter has also been broadened from `Dictionary<string, Dictionary<string, object>>` to `IDictionary<string, object?>`, so any input value type per id is now accepted.
+
+The 404-fallback behavior is unchanged. When an OPA server doesn't implement the `/v1/batch/data` endpoint, the client transparently switches doing a sequence of sequential queries, and reconstructs the same result shape. The fallback is then used for the lifetime of the client.
+
+#### Low-level `OpaApiClient` and Speakeasy types removed
+
+The entire `OpenPolicyAgent.Opa.OpenApi.*` namespace tree is gone, including:
+
+- `OpaApiClient` — the low-level client class.
+- All request and response wrapper types: `ExecutePolicyRequest`, `ExecutePolicyResponse`, `ExecutePolicyWithInputRequest`, `ExecuteBatchPolicyWithInputRequest`, etc.
+- The discriminated-union types `Input`, `Result`, `Responses`, with their `CreateBoolean` / `CreateMapOfAny` / etc. helpers.
+- The wrapper types `SuccessfulPolicyResponse`, `BatchSuccessfulPolicyEvaluation`, `BatchMixedResults`, and their `*WithStatusCode` siblings.
+
+Migrate to the high-level `OpaClient`:
+
+```csharp
+// Before:
+var sdk = new OpaApiClient(serverUrl: opaUrl);
+var req = new ExecutePolicyWithInputRequest() {
+    Path = "app/rbac",
+    RequestBody = new ExecutePolicyWithInputRequestBody() {
+        Input = Input.CreateMapOfAny(input),
+    },
+};
+var res = await sdk.ExecutePolicyWithInputAsync(req);
+var allow = res.SuccessfulPolicyResponse?.Result?.MapOfAny?["allow"];
+
+// After:
+var opa = new OpaClient(serverUrl: opaUrl);
+var result = await opa.Evaluate<Dictionary<string, object>>("app/rbac", input);
+var allow = result["allow"];
+```
+
+If you have a use case that genuinely needs lower-level access than `OpaClient` provides, please open an issue describing it.
+
+#### `OpaError` and result types
+
+`OpaError.HttpStatusCode` has been replaced by `OpaError.StatusCode` (`string?` is now `int?`). The corresponding serialized field is renamed from `http_status_code` to `status_code`. Code asserting on the previous string form needs to be updated:
+
+```csharp
+// Before:
+Assert.Equal("500", err.HttpStatusCode);
+// After:
+Assert.Equal(500, err.StatusCode);
+```
+
+The non-generic `OpaResult` (which leaked the `Result` discriminated-union through) is removed entirely. `OpaResult<T>` (returned by `EvaluateWithMetadataAsync`) replaces it with a fully-typed value. `OpaBatchResults`, `OpaBatchErrors`, `OpaBatchResultGeneric<T>`, `OpaBatchInputs`, and the `DictionaryExtensions` helpers in `OpaBatchTypes.cs` are all removed. The new `Dictionary<string, OpaBatchEntry<T>>` shape provides the same functionality.
+
+#### Exception type renames
+
+The Speakeasy-emitted exception types (`ClientError`, `ServerError`, `BatchServerError`, `SDKException`, `UnhealthyServer`) are removed. Catch the new `OpaException` base type, or one of the subtypes documented above. The all-failures batch case that used to throw `BatchServerError` is now an `OpaServerException` whose `BatchQueryErrors` property carries the per-input details:
+
+```csharp
+// Before:
+catch (BatchServerError bse) {
+    foreach (var (id, srvErr) in bse.Responses!) { ... }
+}
+// After:
+catch (OpaServerException ex) when (ex.BatchQueryErrors is not null) {
+    foreach (var (id, opaErr) in ex.BatchQueryErrors) { ... }
+}
+```
+
+Authored by @philipaconrad
+
+
 ## 1.6.6
 
 This release updates the help text hints for Data Filters to point at the upstream OPA Compile API documentation.
@@ -12,7 +207,7 @@ This release updates the help text hints for Data Filters to point at the upstre
 
 ## 1.6.2, 1.6.3, 1.6.4, 1.6.5
 
-These releases release engineering improvements, including support for publishing Github Releases again.
+These contain release engineering improvements, including support for publishing Github Releases again.
 
 
 ## 1.6.1

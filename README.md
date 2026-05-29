@@ -15,9 +15,8 @@ You can use the OPA C# SDK to connect to [Open Policy Agent](https://www.openpol
 ```bash
 dotnet add package OpenPolicyAgent.Opa
 ```
-<!-- No SDK Installation [installation] -->
 
-## SDK Example Usage (high-level)
+## SDK Example Usage
 
 The following examples assume an OPA server at `http://localhost:8181` equipped with the following Rego policy in `authz.rego`:
 
@@ -130,7 +129,7 @@ content of data.roles:
 
 ### Default Rule
 
-For evaluating the default rule (configured with your OPA service), use `EvaluateDefault`. `input` is optional, and left out in this example:
+For evaluating the default rule (configured with your OPA service), use `EvaluateDefault`. `input` is optional, and left `null` in this example:
 
 ```csharp
 using OpenPolicyAgent.Opa;
@@ -140,10 +139,12 @@ OpaClient opa = new OpaClient(opaUrl);
 
 bool allowed = false;
 
-try {
-    allowed = await opa.EvaluateDefault<bool();
+try
+{
+    allowed = await opa.EvaluateDefault<bool>(input: null);
 }
-catch (OpaException e) {
+catch (OpaException e)
+{
     Console.WriteLine("exception while making request against OPA: " + e);
 }
 
@@ -167,43 +168,39 @@ EOPA supports executing many queries in a single request with the [Batch API][eo
 
 The OPA C# SDK has native support for EOPA's batch API, with a fallback behavior of sequentially executing single queries if the Batch API is unavailable (such as with open source Open Policy Agent).
 
+`EvaluateBatch<T>` returns a dictionary of `OpaBatchEntry<T>`, one entry per input id. Each entry is either a success (with the deserialized `Value`) or a failure (with `Error` populated) — discriminate via `IsSuccess`. The `Successes()` / `Failures()` extension helpers project the dictionary down to one side at a time when that's all the caller wants.
+
 ```csharp
 using OpenPolicyAgent.Opa;
 
 string opaUrl = "http://localhost:8181";
 OpaClient opa = new OpaClient(opaUrl);
 
-var input = new Dictionary<string, Dictionary<string, object>>() {
-    { "AAA", new Dictionary<string, object>() { { "subject", "alice" }, { "action", "read" } } },
-    { "BBB", new Dictionary<string, object>() { { "subject", "bob" }, { "action", "write" } } },
-    { "CCC", new Dictionary<string, object>() { { "subject", "dave" }, { "action", "read" } } },
+var inputs = new Dictionary<string, object?>() {
+    { "AAA", new Dictionary<string, object>() { { "subject", "alice" }, { "action", "read"  } } },
+    { "BBB", new Dictionary<string, object>() { { "subject", "bob"   }, { "action", "write" } } },
+    { "CCC", new Dictionary<string, object>() { { "subject", "dave"  }, { "action", "read"  } } },
     { "DDD", new Dictionary<string, object>() { { "subject", "sybil" }, { "action", "write" } } },
 };
 
-OpaBatchResults results = new OpaBatchResults();
-OpaBatchErrors errors = new OpaBatchErrors();
+Dictionary<string, OpaBatchEntry<bool>> results;
 try
 {
-    (results, errors) = await opa.EvaluateBatch("authz/allow", input);
+    results = await opa.EvaluateBatch<bool>("authz/allow", inputs);
 }
 catch (OpaException e)
 {
     Console.WriteLine("exception while making request against OPA: " + e.Message);
+    return;
 }
 
 Console.WriteLine("Query results, by key:");
-foreach (var pair in results)
+foreach (var (key, entry) in results)
 {
-    Console.WriteLine("  {0} => {1}", pair.Key, pair.Value.Result.Boolean);
-}
-
-if (errors.Count > 0)
-{
-    Console.WriteLine("Query errors, by key:");
-    foreach (var pair in errors)
-    {
-        Console.WriteLine("  {0} => {1}", pair.Key, pair.Value);
-    }
+    if (entry.IsSuccess)
+        Console.WriteLine("  {0} => {1}", key, entry.Value);
+    else
+        Console.WriteLine("  {0} => error: {1}", key, entry.Error!.Message);
 }
 ```
 
@@ -220,11 +217,9 @@ Query results, by key:
 
 </details>
 
-See the [API Documentation](https://open-policy-agent.github.io/opa-csharp/api/OpenPolicyAgent.Opa.OpenApi.Models.Components.Result.html) for reference on the properties and types available from a result.
-
 ### Using Custom Classes for Input and Output
 
-Using the OPA C# SDK, it can be more natural to use custom class types as inputs and outputs to a policy, rather than `System.Collections.Dictionary` (or `Collections.List`). Internally, the OPA C# SDK uses [`Newtonsoft.Json`](https://www.newtonsoft.com/json) to serialize and deserialize inputs and outputs JSON to the provided types.
+Using the OPA C# SDK, it can be more natural to use custom class types as inputs and outputs to a policy, rather than `System.Collections.Dictionary` (or `Collections.List`). By default, the OPA C# SDK uses [`Newtonsoft.Json`](https://www.newtonsoft.com/json) to serialize and deserialize inputs and outputs JSON to the provided types — see the *Pluggable JSON serializer* section below for swapping in `System.Text.Json`.
 
 In the example below, note:
 
@@ -308,6 +303,34 @@ allowed: False
 
 </details>
 
+### Decision metadata
+
+When a caller needs OPA's `decision_id`, query metrics, or bundle provenance alongside the policy result — for example, to correlate an allow/deny decision with a downstream side effect in an audit log — use `EvaluateWithMetadataAsync<T>`. It returns an `OpaResult<T>` carrying the deserialized value plus the metadata fields.
+
+```csharp
+using OpenPolicyAgent.Opa;
+
+var opa = new OpaClient("http://localhost:8181");
+
+var input = new Dictionary<string, object>() {
+    { "subject", "alice" },
+    { "action", "read" },
+};
+
+OpaResult<bool> result = await opa.EvaluateWithMetadataAsync<bool>(
+    "authz/allow",
+    input,
+    provenance: true,
+    metrics: false);
+
+Console.WriteLine("allowed:     {0}", result.Value);
+Console.WriteLine("decision id: {0}", result.DecisionId ?? "<none>");
+if (result.Provenance is not null)
+{
+    Console.WriteLine("OPA version: {0}", result.Provenance.Version);
+}
+```
+
 ### Integrating logging with the OPA C# SDK
 
 The OPA C# SDK uses opt-in, [compile-time source generated logging](https://learn.microsoft.com/en-us/dotnet/core/extensions/logger-message-generator), which can be integrated as a part of the overall logs of a larger application.
@@ -351,245 +374,118 @@ Unhandled exception. OpaException: executing policy at 'this/rule/does/not/exist
 
 </details>
 
+## Configuration
+
+### Server URL
+
+The default `OpaClient()` constructor connects to `http://localhost:8181`. Override the server URL by passing a `serverUrl` argument:
+
+```csharp
+var opa = new OpaClient(serverUrl: "http://opa.example.internal:8181");
+```
+
+### Authentication: bearer token
+
+To authenticate to a server that requires a bearer token, pass a `bearerTokenSource` callback. The callback is invoked once per request, so it can return a rotating token without needing to reconstruct the client:
+
+```csharp
+var opa = new OpaClient(
+    serverUrl: "https://opa.example.internal:8181",
+    bearerTokenSource: () => GetCurrentToken());
+```
+
+### Custom HttpClient
+
+For full control over timeouts, custom `DelegatingHandler`s, mTLS, proxy configuration, or auth schemes other than bearer tokens, pass your own `HttpClient`:
+
+```csharp
+var handler = new SocketsHttpHandler {
+    PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+};
+var http = new HttpClient(handler) {
+    Timeout = TimeSpan.FromSeconds(30),
+};
+
+var opa = new OpaClient(serverUrl: "https://opa.example.internal:8181", httpClient: http);
+```
+
+When a custom `HttpClient` is supplied, the SDK does not dispose of it — the caller owns its lifecycle.
+
+### Pluggable JSON serializer
+
+The SDK ships with two implementations of the `IOpaSerializer` interface:
+
+| Serializer | When to use |
+| --- | --- |
+| `NewtonsoftOpaSerializer` (default) | Default — used when no serializer is specified. Honors `Newtonsoft.Json.JsonSerializerSettings` and any custom `JsonConverter`s registered through them. |
+| `SystemTextJsonOpaSerializer`       | Opt in if your project standardizes on `System.Text.Json`. Honors `JsonSerializerOptions`. |
+
+```csharp
+using OpenPolicyAgent.Opa;
+using OpenPolicyAgent.Opa.Serialization;
+
+var opa = new OpaClient(
+    serverUrl: "http://localhost:8181",
+    serializer: new SystemTextJsonOpaSerializer());
+```
+
 > [!NOTE]
-> For low-level SDK usage, see the sections below.
+> `GetFilters` / `GetMultipleFilters` currently still require Newtonsoft for response parsing because the `OpenPolicyAgent.Ucast.Linq` package ships Newtonsoft-specific `JsonConverter`s on its filter types. Other operations work end-to-end under either serializer.
 
----
-
-# OPA OpenAPI SDK (low-level)
-
-<!-- Start Summary [summary] -->
-## Summary
-
-For more information about the API: [EOPA documentation](https://github.com/open-policy-agent/eopa/docs)
-<!-- End Summary [summary] -->
-
-<!-- Start Table of Contents [toc] -->
-## Table of Contents
-<!-- $toc-max-depth=2 -->
-- [OPA C# SDK](#opa-c-sdk)
-  - [SDK Installation](#sdk-installation)
-  - [SDK Example Usage (high-level)](#sdk-example-usage-high-level)
-- [OPA OpenAPI SDK (low-level)](#opa-openapi-sdk-low-level)
-  - [SDK Example Usage](#sdk-example-usage)
-  - [Available Resources and Operations](#available-resources-and-operations)
-  - [Server Selection](#server-selection)
-  - [Error Handling](#error-handling)
-  - [Authentication](#authentication)
-  - [Community](#community)
-
-<!-- End Table of Contents [toc] -->
-
-<!-- Start SDK Example Usage [usage] -->
-## SDK Example Usage
-
-### Example 1
-
-```csharp
-using OpenPolicyAgent.Opa.OpenApi;
-using OpenPolicyAgent.Opa.OpenApi.Models.Components;
-
-var sdk = new OpaApiClient();
-
-var res = await sdk.ExecuteDefaultPolicyWithInputAsync(
-    input: Input.CreateNumber(
-        4963.69D
-    ),
-    pretty: false,
-    acceptEncoding: GzipAcceptEncoding.Gzip
-);
-
-// handle response
-```
-
-### Example 2
-
-```csharp
-using OpenPolicyAgent.Opa.OpenApi;
-using OpenPolicyAgent.Opa.OpenApi.Models.Requests;
-
-var sdk = new OpaApiClient();
-
-ExecutePolicyWithInputRequest req = new ExecutePolicyWithInputRequest() {
-    Path = "app/rbac",
-    RequestBody = new ExecutePolicyWithInputRequestBody() {
-        Input = Input.CreateBoolean(
-            false
-        ),
-    },
-};
-
-var res = await sdk.ExecutePolicyWithInputAsync(req);
-
-// handle response
-```
-
-### Example 3
-
-```csharp
-using OpenPolicyAgent.Opa.OpenApi;
-using OpenPolicyAgent.Opa.OpenApi.Models.Components;
-using OpenPolicyAgent.Opa.OpenApi.Models.Requests;
-using System.Collections.Generic;
-
-var sdk = new OpaApiClient();
-
-ExecuteBatchPolicyWithInputRequest req = new ExecuteBatchPolicyWithInputRequest() {
-    Path = "app/rbac",
-    RequestBody = new ExecuteBatchPolicyWithInputRequestBody() {
-        Inputs = new Dictionary<string, Input>() {
-            { "key", Input.CreateStr(
-                "<value>"
-            ) },
-        },
-    },
-};
-
-var res = await sdk.ExecuteBatchPolicyWithInputAsync(req);
-
-// handle response
-```
-<!-- End SDK Example Usage [usage] -->
-
-<!-- Start Available Resources and Operations [operations] -->
-## Available Resources and Operations
-
-<details open>
-<summary>Available methods</summary>
-
-### [OpaApiClient SDK](docs/sdks/opaapiclient/README.md)
-
-- [ExecuteDefaultPolicyWithInput](docs/sdks/opaapiclient/README.md#executedefaultpolicywithinput) - Execute the default decision  given an input
-- [ExecutePolicy](docs/sdks/opaapiclient/README.md#executepolicy) - Execute a policy
-- [ExecutePolicyWithInput](docs/sdks/opaapiclient/README.md#executepolicywithinput) - Execute a policy given an input
-- [ExecuteBatchPolicyWithInput](docs/sdks/opaapiclient/README.md#executebatchpolicywithinput) - Execute a policy given a batch of inputs
-- [CompileQueryWithPartialEvaluation](docs/sdks/opaapiclient/README.md#compilequerywithpartialevaluation) - Partially evaluate a query
-- [Health](docs/sdks/opaapiclient/README.md#health) - Verify the server is operational
-
-</details>
-<!-- End Available Resources and Operations [operations] -->
-
-<!-- Start Server Selection [server] -->
-## Server Selection
-
-### Override Server URL Per-Client
-
-The default server can be overridden globally by passing a URL to the `serverUrl: string` optional parameter when initializing the SDK client instance. For example:
-
-```csharp
-using OpenPolicyAgent.Opa.OpenApi;
-using OpenPolicyAgent.Opa.OpenApi.Models.Components;
-
-var sdk = new OpaApiClient(serverUrl: "http://localhost:8181");
-
-var res = await sdk.ExecuteDefaultPolicyWithInputAsync(
-    input: Input.CreateNumber(
-        4963.69D
-    ),
-    pretty: false,
-    acceptEncoding: GzipAcceptEncoding.Gzip
-);
-
-// handle response
-```
-<!-- End Server Selection [server] -->
-
-<!-- Start Error Handling [errors] -->
 ## Error Handling
 
-Handling errors in this SDK should largely match your expectations. All operations return a response object or throw an exception.
+All exceptions thrown by the SDK derive from `OpaException`. Specialized subtypes discriminate the failure class so callers can pick a level of granularity that fits their use case:
 
-By default, an API error will raise a `OpenPolicyAgent.Opa.OpenApi.Models.Errors.SDKException` exception, which has the following properties:
+| Subtype | Thrown for |
+| --- | --- |
+| `OpaTransportException`     | Network failures: DNS resolution, connect, read timeout, TLS handshake. `StatusCode` is always null. |
+| `OpaPolicyException`        | HTTP 4xx — malformed query, invalid input, unknown path, batch endpoint not present on this server. The request will not succeed if retried unchanged. |
+| `OpaServerException`        | HTTP 5xx — policy evaluation errors, internal errors. Often safe to retry. For batch endpoints that return 500 across all inputs, exposes the per-input details via `BatchQueryErrors`. |
+| `OpaSerializationException` | Unexpected content type, malformed JSON, or a type-coercion failure when binding the policy result to the requested generic `T`. |
 
-| Property      | Type                  | Description           |
-|---------------|-----------------------|-----------------------|
-| `Message`     | *string*              | The error message     |
-| `StatusCode`  | *int*                 | The HTTP status code  |
-| `RawResponse` | *HttpResponseMessage* | The raw HTTP response |
-| `Body`        | *string*              | The response content  |
+All subtypes inherit the rich properties on `OpaException`:
 
-When custom error responses are specified for an operation, the SDK may also throw their associated exceptions. You can refer to respective *Errors* tables in SDK docs for more details on possible exception types for each operation. For example, the `ExecuteDefaultPolicyWithInputAsync` method throws the following exceptions:
+| Property     | Type    | Description |
+| ------------ | ------- | ----------- |
+| `StatusCode` | `int?`  | HTTP status code returned by OPA. Null for transport-level failures. |
+| `Code`       | `string?` | OPA short-form error code, e.g. `"internal_error"`. |
+| `DecisionId` | `string?` | Decision identifier supplied by OPA when decision logging is enabled. |
+| `RawBody`    | `string?` | Raw HTTP response body, when available. |
 
-| Error Type                                   | Status Code | Content Type     |
-| -------------------------------------------- | ----------- | ---------------- |
-| OpenPolicyAgent.Opa.OpenApi.Models.Errors.ClientError  | 400, 404    | application/json |
-| OpenPolicyAgent.Opa.OpenApi.Models.Errors.ServerError  | 500         | application/json |
-| OpenPolicyAgent.Opa.OpenApi.Models.Errors.SDKException | 4XX, 5XX    | \*/\*            |
-
-### Example
+Catch the base type to fail closed across any SDK error:
 
 ```csharp
-using OpenPolicyAgent.Opa.OpenApi;
-using OpenPolicyAgent.Opa.OpenApi.Models.Components;
-using OpenPolicyAgent.Opa.OpenApi.Models.Errors;
-
-var sdk = new OpaApiClient();
-
 try
 {
-    var res = await sdk.ExecuteDefaultPolicyWithInputAsync(
-        input: Input.CreateNumber(
-            4963.69D
-        ),
-        pretty: false,
-        acceptEncoding: GzipAcceptEncoding.Gzip
-    );
-
-    // handle response
+    var allowed = await opa.Check("authz/allow", input);
+    if (!allowed) DenyRequest();
 }
-catch (Exception ex)
+catch (OpaException)
 {
-    if (ex is ClientError)
-    {
-        // Handle exception data
-        throw;
-    }
-    else if (ex is Models.Errors.ServerError)
-    {
-        // Handle exception data
-        throw;
-    }
-    else if (ex is OpenPolicyAgent.Opa.OpenApi.Models.Errors.SDKException)
-    {
-        // Handle default exception
-        throw;
-    }
+    DenyRequest(); // fail closed
 }
 ```
-<!-- End Error Handling [errors] -->
 
-<!-- Start Authentication [security] -->
-## Authentication
-
-### Per-Client Security Schemes
-
-This SDK supports the following security scheme globally:
-
-| Name         | Type | Scheme      |
-| ------------ | ---- | ----------- |
-| `BearerAuth` | http | HTTP Bearer |
-
-To authenticate with the API the `BearerAuth` parameter must be set when initializing the SDK client instance. For example:
+Or discriminate on the specific failure class:
 
 ```csharp
-using OpenPolicyAgent.Opa.OpenApi;
-using OpenPolicyAgent.Opa.OpenApi.Models.Components;
-
-var sdk = new OpaApiClient(bearerAuth: "<YOUR_BEARER_TOKEN_HERE>");
-
-var res = await sdk.ExecuteDefaultPolicyWithInputAsync(
-    input: Input.CreateNumber(
-        4963.69D
-    ),
-    pretty: false,
-    acceptEncoding: GzipAcceptEncoding.Gzip
-);
-
-// handle response
+try
+{
+    var allowed = await opa.Check("authz/allow", input);
+}
+catch (OpaServerException e) when (e.Code == "internal_error")
+{
+    // 5xx on the OPA side; probably worth a retry
+}
+catch (OpaPolicyException e)
+{
+    // 4xx; the request itself is malformed, retry won't help
+}
+catch (OpaTransportException)
+{
+    // network problem reaching OPA; trip the circuit breaker
+}
 ```
-<!-- End Authentication [security] -->
-
-<!-- Placeholder for Future Speakeasy SDK Sections -->
 
 ## Community
 

@@ -1,17 +1,15 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
-using System.Web;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Newtonsoft.Json;
 using OpenPolicyAgent.Opa.Filters;
-using OpenPolicyAgent.Opa.OpenApi;
-using OpenPolicyAgent.Opa.OpenApi.Models.Components;
-using OpenPolicyAgent.Opa.OpenApi.Models.Errors;
-using OpenPolicyAgent.Opa.OpenApi.Models.Requests;
+using OpenPolicyAgent.Opa.Internal;
+using OpenPolicyAgent.Opa.Serialization;
 
 namespace OpenPolicyAgent.Opa;
 
@@ -21,854 +19,475 @@ namespace OpenPolicyAgent.Opa;
 /// </summary>
 public class OpaClient
 {
-    private readonly OpaApiClient opa;
+    private const string DefaultServerUrl = "http://localhost:8181";
 
-    // Default values to use when creating the SDK instance.
-    private static readonly string sdkServerUrl = "http://localhost:8181";
+    private readonly OpaHttp _http;
+    private readonly IOpaSerializer _defaultSerializer;
     private readonly string _serverUrl;
-
-    // Internal: Records whether or not to go to fallback mode immediately for
-    // batched queries. It is switched over to false as soon as it gets a 404
-    // from an OPA server.
-    private bool opaSupportsBatchQueryAPI = true;
-
-    // Values to use when generating requests.
-    private readonly bool requestPretty = false;
-    private readonly bool requestProvenance = false;
-    private readonly Explain requestExplain = Explain.Notes;
-    private readonly bool requestMetrics = false;
-    private readonly bool requestInstrument = false;
-    private readonly bool requestStrictBuiltinErrors = false;
-
     private readonly ILogger _logger;
 
-    private readonly JsonSerializerSettings? _jsonSerializerSettings;
+    // Records whether to go to fallback mode immediately for batched queries.
+    // Switched to false the first time the OPA server returns a 404 from
+    // /v1/batch/data (vanilla OSS OPA, where that endpoint isn't implemented).
+    private bool _opaSupportsBatchQueryAPI = true;
+
+    private static readonly EvalRequestOptions DefaultOptions = new()
+    {
+        Pretty = false,
+        Provenance = false,
+        Explain = "notes",
+        Metrics = false,
+        Instrument = false,
+        StrictBuiltinErrors = false,
+    };
 
     /// <summary>
     /// Constructs an OpaClient, connecting to a specified server address if provided.
     /// </summary>
     /// <param name="serverUrl">The URL for connecting to the OPA server instance. (default: "http://localhost:8181")</param>
     /// <param name="logger">The ILogger instance to use for this OpaClient. (default: NullLogger)</param>
-    /// <param name="jsonSerializerSettings">The Newtonsoft.Json.JsonSerializerSettings to use as the default for serializing inputs for OPA. (default: none)</param>
-    public OpaClient(string? serverUrl = null, ILogger<OpaClient>? logger = null, JsonSerializerSettings? jsonSerializerSettings = null)
+    /// <param name="jsonSerializerSettings">The Newtonsoft.Json.JsonSerializerSettings to use as the default for serializing inputs for OPA. Ignored when an explicit <paramref name="serializer"/> is supplied. (default: SDK defaults that include OPA's value-shape converters)</param>
+    /// <param name="serializer">Pluggable JSON (de)serialization strategy. Pass an instance of <see cref="NewtonsoftOpaSerializer"/> or <see cref="SystemTextJsonOpaSerializer"/>. (default: <see cref="NewtonsoftOpaSerializer"/> initialized from <paramref name="jsonSerializerSettings"/>)</param>
+    /// <param name="httpClient">A custom HttpClient instance to use for all requests. Useful for setting timeouts, custom DelegatingHandlers, or non-bearer auth schemes. (default: a process-wide shared HttpClient)</param>
+    /// <param name="bearerTokenSource">An optional callback returning a bearer token to attach to each request. Invoked once per request, so token rotation is supported. (default: no Authorization header)</param>
+    public OpaClient(
+        string? serverUrl = null,
+        ILogger<OpaClient>? logger = null,
+        JsonSerializerSettings? jsonSerializerSettings = null,
+        IOpaSerializer? serializer = null,
+        HttpClient? httpClient = null,
+        Func<string>? bearerTokenSource = null)
     {
-        opa = new OpaApiClient(serverIndex: 0, serverUrl: serverUrl ?? sdkServerUrl);
-        _serverUrl = serverUrl?.TrimEnd('/') ?? sdkServerUrl;
+        _serverUrl = serverUrl?.TrimEnd('/') ?? DefaultServerUrl;
         _logger = logger ?? new NullLogger<OpaClient>();
-        _jsonSerializerSettings = jsonSerializerSettings;
+        _defaultSerializer = serializer ?? new NewtonsoftOpaSerializer(jsonSerializerSettings);
+        _http = new OpaHttp(_serverUrl, _defaultSerializer, httpClient, bearerTokenSource);
     }
 
-    /// <summary>
-    /// Simple allow/deny-style check against a rule, using the provided object,
-    /// This will round-trip an object through Newtonsoft.JsonConvert, in order
-    /// to generate the input object for the eventual OPA API call.
-    /// </summary>
-    /// <param name="input">The input C# object OPA will use for evaluating the rule.</param>
-    /// <param name="path">The rule to evaluate. (Example: "app/rbac")</param>
-    /// <param name="jsonSerializerSettings">The Newtonsoft.Json.JsonSerializerSettings object to use for round-tripping the input through JSON serdes. (default: global serializer settings, if any)</param>
-    /// <returns>Result, as a boolean</returns>
-    public async Task<bool> Check(string path, object? input, JsonSerializerSettings? jsonSerializerSettings = null)
-    {
-        if (input is null)
-        {
-            return await Evaluate<bool>(path, input);
-        }
-        // Round-trip through JSON conversion, such that it becomes an Input.
-        var jsonInput = JsonConvert.SerializeObject(input, jsonSerializerSettings ?? _jsonSerializerSettings);
-        var roundTrippedInput = JsonConvert.DeserializeObject<Input>(jsonInput, jsonSerializerSettings ?? _jsonSerializerSettings) ?? throw new OpaException(string.Format("could not convert object type to a valid OPA input"));
-        return await Evaluate<bool>(path, roundTrippedInput);
-    }
+    // ---------- single-eval high-level API ----------
 
     /// <summary>
-    /// Evaluate a policy, using the provided object, then coerce the result to
-    /// type T. This will round-trip an object through Newtonsoft.JsonConvert,
-    /// in order to generate the input object for the eventual OPA API call.
+    /// Simple allow/deny-style check against a rule, using the provided object.
+    /// Equivalent to <see cref="Evaluate{T}"/> with <c>T = bool</c>.
     /// </summary>
-    /// <param name="input">The input C# object OPA will use for evaluating the rule.</param>
     /// <param name="path">The rule to evaluate. (Example: "app/rbac")</param>
-    /// <param name="jsonSerializerSettings">The Newtonsoft.Json.JsonSerializerSettings object to use for round-tripping the input through JSON serdes. (default: global serializer settings, if any)</param>
-    /// <returns>Result, as an instance of T</returns>
+    /// <param name="input">The input C# object OPA will use for evaluating the rule.</param>
+    /// <param name="jsonSerializerSettings">Optional Newtonsoft serializer settings used for serializing <paramref name="input"/> on this call only.</param>
+    public Task<bool> Check(string path, object? input, JsonSerializerSettings? jsonSerializerSettings = null)
+        => Evaluate<bool>(path, input, jsonSerializerSettings);
+
+    /// <summary>
+    /// Evaluate a policy and coerce the result to type <typeparamref name="T"/>.
+    /// Throws an <see cref="OpaException"/> subtype on failure.
+    /// </summary>
+    /// <param name="path">The rule to evaluate. (Example: "app/rbac")</param>
+    /// <param name="input">The input C# object OPA will use for evaluating the rule.</param>
+    /// <param name="jsonSerializerSettings">Optional per-call Newtonsoft serializer settings used to round-trip <paramref name="input"/> before sending. Output deserialization always uses the configured default serializer.</param>
     public async Task<T> Evaluate<T>(string path, object? input, JsonSerializerSettings? jsonSerializerSettings = null)
     {
-        if (input is null)
-        {
-            return await QueryMachinery<T>(path, Input.CreateNull());
-        }
-        // Round-trip through JSON conversion, such that it becomes an Input.
-        var jsonInput = JsonConvert.SerializeObject(input, jsonSerializerSettings ?? _jsonSerializerSettings);
-        var roundTrippedInput = JsonConvert.DeserializeObject<Input>(jsonInput, jsonSerializerSettings ?? _jsonSerializerSettings) ?? throw new OpaException(string.Format("could not convert object type to a valid OPA input"));
-        return await QueryMachinery<T>(path, roundTrippedInput);
-    }
-
-    /// <summary>
-    /// Evaluate the server's default policy, using the provided object, then
-    /// coerce the result to type T. This will round-trip an object through
-    /// Newtonsoft.JsonConvert, in order to generate the input object for the
-    /// eventual OPA API call.
-    /// </summary>
-    /// <param name="input">The input C# object OPA will use for evaluating the rule.</param>
-    /// <param name="jsonSerializerSettings">The Newtonsoft.Json.JsonSerializerSettings object to use for round-tripping the input through JSON serdes. (default: global serializer settings, if any)</param>
-    /// <returns>Result, as an instance of T</returns>
-    public async Task<T> EvaluateDefault<T>(object? input, JsonSerializerSettings? jsonSerializerSettings = null)
-    {
-        if (input is null)
-        {
-            return await QueryMachineryDefault<T>(Input.CreateNull());
-        }
-        // Round-trip through JSON conversion, such that it becomes an Input.
-        var jsonInput = JsonConvert.SerializeObject(input, jsonSerializerSettings ?? _jsonSerializerSettings);
-        var roundTrippedInput = JsonConvert.DeserializeObject<Input>(jsonInput, jsonSerializerSettings ?? _jsonSerializerSettings) ?? throw new OpaException(string.Format("could not convert object type to a valid OPA input"));
-        return await QueryMachineryDefault<T>(roundTrippedInput);
-    }
-
-    /// <exclude />
-    private async Task<T> QueryMachinery<T>(string path, Input input)
-    {
-        ExecutePolicyWithInputResponse res;
+        EvalEnvelope env;
         try
         {
-            res = await EvalPolicySingle(path, input);
+            env = await _http.EvaluateAsync(path, MaybeRoundTrip(input, jsonSerializerSettings), DefaultOptions).ConfigureAwait(false);
+        }
+        catch (OpaException e)
+        {
+            LogMessages.LogQueryError(_logger, path, e.Message);
+            throw;
         }
         catch (Exception e)
         {
             LogMessages.LogQueryError(_logger, path, e.Message);
-            var msg = string.Format("executing policy at '{0}' with failed due to exception '{1}'", path, e);
-            throw new OpaException(msg, e);
+            throw new OpaException($"executing policy at '{path}' failed due to exception '{e}'", e);
         }
-
-        var result = res.SuccessfulPolicyResponse?.Result;
-        if (result is null)
-        {
-            LogMessages.LogQueryNullResult(_logger, path);
-            var msg = string.Format("executing policy at '{0}' succeeded, but OPA did not reply with a result", path);
-            throw new OpaException(msg);
-        }
-        return ConvertResult<T>(result);
+        return CoerceResult<T>(env.RawResultJson, path);
     }
 
-    /// <exclude />
-    private async Task<T> QueryMachineryDefault<T>(Input input)
+    /// <summary>
+    /// Evaluate the server's default policy and coerce the result to type <typeparamref name="T"/>.
+    /// </summary>
+    public async Task<T> EvaluateDefault<T>(object? input, JsonSerializerSettings? jsonSerializerSettings = null)
     {
-        ExecuteDefaultPolicyWithInputResponse res;
+        EvalEnvelope env;
         try
         {
-            res = await opa.ExecuteDefaultPolicyWithInputAsync(input, requestPretty);
+            env = await _http.EvaluateDefaultAsync(MaybeRoundTrip(input, jsonSerializerSettings), DefaultOptions).ConfigureAwait(false);
+        }
+        catch (OpaException e)
+        {
+            LogMessages.LogDefaultQueryError(_logger, e.Message);
+            throw;
         }
         catch (Exception e)
         {
             LogMessages.LogDefaultQueryError(_logger, e.Message);
-            var msg = string.Format("executing server default policy failed due to exception '{0}'", e);
-            throw new OpaException(msg, e);
+            throw new OpaException($"executing server default policy failed due to exception '{e}'", e);
         }
-
-        var result = res.Result;
-        if (result is null)
-        {
-            LogMessages.LogDefaultQueryNullResult(_logger);
-            var msg = string.Format("executing server default policy succeeded, but OPA did not reply with a result");
-            throw new OpaException(msg);
-        }
-        return ConvertResult<T>(result);
+        return CoerceDefault<T>(env.RawResultJson);
     }
 
     /// <summary>
-    /// Evaluate a policy, using the provided map of query inputs. Results will
-    /// be returned in an identically-structured pair of maps, one for
-    /// successful evals, and one for errors. In the event that the OPA server
-    /// does not support the /v1/batch/data endpoint, this method will fall back
-    /// to performing sequential queries against the OPA server.
+    /// Evaluate a policy and return the deserialized result alongside OPA's
+    /// per-decision metadata (decision_id, metrics, provenance). Useful for
+    /// audit logging or correlating policy decisions with downstream effects.
     /// </summary>
-    /// <param name="path">The rule to evaluate. (Example: "app/rbac")</param>
-    /// <param name="inputs">The input Dictionary OPA will use for evaluating the rule. The keys are arbitrary ID strings, the values are the input values intended for each query.</param>
-    /// <returns>A pair of mappings, between string keys, and SuccessfulPolicyResponses, or ServerErrors.</returns>
-    public async Task<(OpaBatchResults, OpaBatchErrors)> EvaluateBatch(string path, Dictionary<string, Dictionary<string, object>> inputs)
+    /// <typeparam name="T">The type to deserialize the policy result into.</typeparam>
+    /// <param name="path">The rule to evaluate.</param>
+    /// <param name="input">The input C# object OPA will use for evaluating the rule.</param>
+    /// <param name="provenance">Whether to request OPA build/bundle provenance metadata.</param>
+    /// <param name="metrics">Whether to request OPA query performance metrics.</param>
+    /// <param name="jsonSerializerSettings">Optional per-call Newtonsoft serializer settings.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<OpaResult<T>> EvaluateWithMetadataAsync<T>(
+        string path,
+        object? input,
+        bool provenance = true,
+        bool metrics = false,
+        JsonSerializerSettings? jsonSerializerSettings = null,
+        CancellationToken ct = default)
     {
-        return await QueryMachineryBatch(path, inputs);
-    }
-
-    /// <exclude />
-    private async Task<(OpaBatchResults, OpaBatchErrors)> QueryMachineryBatch(string path, Dictionary<string, Dictionary<string, object>> inputs)
-    {
-        OpaBatchResults successResults;
-        OpaBatchErrors failureResults;
-
-        // Attempt using the /v1/batch/data endpoint. If we ever receive a 404, then it's a vanilla OPA instance, and we should skip straight to fallback mode.
-        if (opaSupportsBatchQueryAPI)
-        {
-            var req = new ExecuteBatchPolicyWithInputRequest()
-            {
-                Path = path,
-                RequestBody = new ExecuteBatchPolicyWithInputRequestBody()
-                {
-                    Inputs = inputs.ToOpaBatchInputRaw(),
-                },
-                Pretty = requestPretty,
-                Provenance = requestProvenance,
-                Explain = requestExplain,
-                Metrics = requestMetrics,
-                Instrument = requestInstrument,
-                StrictBuiltinErrors = requestStrictBuiltinErrors,
-            };
-
-            // Launch query. The all-errors case is handled in the exception handler block.
-            ExecuteBatchPolicyWithInputResponse res;
-            try
-            {
-                res = await opa.ExecuteBatchPolicyWithInputAsync(req);
-                switch (res.StatusCode)
-                {
-                    // All-success case.
-                    case 200:
-                        successResults = res.BatchSuccessfulPolicyEvaluation!.Responses!.ToOpaBatchResults(); // Should not be null here.
-                        failureResults = [];
-                        return (successResults, failureResults);
-                    // Mixed results case.
-                    case 207:
-                        var mixedResponses = res.BatchMixedResults?.Responses!; // Should not be null here.
-                        var numSuccess = mixedResponses.Values.Where(v => v.Type == ResponsesType.TwoHundred).Count();
-                        var numErr = mixedResponses.Values.Where(v => v.Type == ResponsesType.FiveHundred).Count();
-                        successResults = new(numSuccess);
-                        failureResults = new(numErr);
-                        foreach (var (key, value) in mixedResponses)
-                        {
-                            switch (value.Type.ToString())
-                            {
-                                case "200":
-                                    successResults.Add(key, (OpaResult)value.SuccessfulPolicyResponseWithStatusCode!);
-                                    break;
-                                case "500":
-                                    failureResults.Add(key, (OpaError)value.ServerErrorWithStatusCode!); // Should not be null.
-                                    break;
-                            }
-                        }
-
-                        return (successResults, failureResults);
-                    default:
-                        // TODO: Throw exception if we reach the end of this block without a successful return.
-                        // This *should* never happen. It means we didn't return from the batch or fallback handler blocks earlier.
-                        throw new Exception("Impossible error");
-                }
-            }
-            catch (ClientError)
-            {
-                throw; // Rethrow for the caller to deal with. Request was malformed.
-            }
-            catch (BatchServerError bse)
-            {
-                failureResults = bse.Responses!.ToOpaBatchErrors(); // Should not be null here.
-                successResults = [];
-                return (successResults, failureResults);
-            }
-            catch (SDKException se) when (se.StatusCode == 404)
-            {
-                // We know we've got an issue now.
-                opaSupportsBatchQueryAPI = false;
-                LogMessages.LogBatchQueryFallback(_logger);
-                // Fall-through to the "unsupported" case.
-            }
-        }
-        // Implicitly rethrow all other exceptions.
-
-        // Fall back to sequential queries against the OPA instance.
-        if (!opaSupportsBatchQueryAPI)
-        {
-            successResults = [];
-            failureResults = [];
-            foreach (var (key, value) in inputs)
-            {
-                try
-                {
-                    var res = await EvalPolicySingle(path, Input.CreateMapOfAny(value));
-                    successResults.Add(key, (OpaResult)res.SuccessfulPolicyResponse!);
-                }
-                catch (ClientError)
-                {
-                    throw; // Rethrow for the caller to deal with. Request was malformed.
-                }
-                catch (OpenPolicyAgent.Opa.OpenApi.Models.Errors.ServerError se)
-                {
-                    failureResults.Add(key, (OpaError)se);
-                }
-                // Implicitly rethrow all other exceptions.
-            }
-
-            // If we have the mixed case, add the HttpStatusCode fields.
-            if (successResults.Count > 0 && failureResults.Count > 0)
-            {
-                // Modifying the dictionary element while iterating is a language feature since 2020, apparently.
-                // Ref: https://github.com/dotnet/runtime/pull/34667
-                foreach (var key in successResults.Keys)
-                {
-                    successResults[key].HttpStatusCode = "200";
-                }
-                foreach (var key in failureResults.Keys)
-                {
-                    failureResults[key].HttpStatusCode = "500";
-                }
-            }
-
-            return (successResults, failureResults);
-        }
-
-        // This *should* never happen. It means we didn't return from the batch or fallback handler blocks earlier.
-        throw new Exception("Impossible error");
-    }
-
-    /// <summary>
-    /// Evaluate a policy, using the provided map of query inputs. Results will
-    /// be returned in an identically-structured pair of maps, one for
-    /// successful evals, and one for errors. In the event that the OPA server
-    /// does not support the /v1/batch/data endpoint, this method will fall back
-    /// to performing sequential queries against the OPA server.
-    /// </summary>
-    /// <param name="path">The rule to evaluate. (Example: "app/rbac")</param>
-    /// <param name="inputs">The input Dictionary OPA will use for evaluating the rule. The keys are arbitrary ID strings, the values are the input values intended for each query.</param>
-    /// <returns>A pair of mappings, between string keys, and generic type T, or ServerErrors.</returns>
-    public async Task<(OpaBatchResultGeneric<T>, OpaBatchErrors)> EvaluateBatch<T>(string path, Dictionary<string, Dictionary<string, object>> inputs)
-    {
-        return await QueryMachineryBatch<T>(path, inputs);
-    }
-
-    /// <exclude />
-    private async Task<(OpaBatchResultGeneric<T>, OpaBatchErrors)> QueryMachineryBatch<T>(string path, Dictionary<string, Dictionary<string, object>> inputs)
-    {
-        OpaBatchResultGeneric<T> successResults;
-        OpaBatchErrors failureResults;
-
-        // Attempt using the /v1/batch/data endpoint. If we ever receive a 404, then it's a vanilla OPA instance, and we should skip straight to fallback mode.
-        if (opaSupportsBatchQueryAPI)
-        {
-            var req = new ExecuteBatchPolicyWithInputRequest()
-            {
-                Path = path,
-                RequestBody = new ExecuteBatchPolicyWithInputRequestBody()
-                {
-                    Inputs = inputs.ToOpaBatchInputRaw(),
-                },
-                Pretty = requestPretty,
-                Provenance = requestProvenance,
-                Explain = requestExplain,
-                Metrics = requestMetrics,
-                Instrument = requestInstrument,
-                StrictBuiltinErrors = requestStrictBuiltinErrors,
-            };
-
-            // Launch query. The all-errors case is handled in the exception handler block.
-            ExecuteBatchPolicyWithInputResponse res;
-            try
-            {
-                res = await opa.ExecuteBatchPolicyWithInputAsync(req);
-                switch (res.StatusCode)
-                {
-                    // All-success case.
-                    case 200:
-                        successResults = res.BatchSuccessfulPolicyEvaluation!.Responses!.ToOpaBatchResults<T>(); // Should not be null here.
-                        failureResults = [];
-                        return (successResults, failureResults);
-                    // Mixed results case.
-                    case 207:
-                        var mixedResponses = res.BatchMixedResults?.Responses!; // Should not be null here.
-                        var numSuccess = mixedResponses.Values.Where(v => v.Type == ResponsesType.TwoHundred).Count();
-                        var numErr = mixedResponses.Values.Where(v => v.Type == ResponsesType.FiveHundred).Count();
-                        successResults = new(numSuccess);
-                        failureResults = new(numErr);
-                        foreach (var (key, value) in mixedResponses)
-                        {
-                            switch (value.Type.ToString())
-                            {
-                                case "200":
-                                    successResults.Add(key, ConvertResult<T>(value.SuccessfulPolicyResponseWithStatusCode!.Result!));
-                                    break;
-                                case "500":
-                                    failureResults.Add(key, (OpaError)value.ServerErrorWithStatusCode!); // Should not be null.
-                                    break;
-                            }
-                        }
-
-                        return (successResults, failureResults);
-                    default:
-                        // TODO: Throw exception if we reach the end of this block without a successful return.
-                        // This *should* never happen. It means we didn't return from the batch or fallback handler blocks earlier.
-                        throw new Exception("Impossible error");
-                }
-            }
-            catch (ClientError)
-            {
-                throw; // Rethrow for the caller to deal with. Request was malformed.
-            }
-            catch (BatchServerError bse)
-            {
-                failureResults = bse.Responses!.ToOpaBatchErrors(); // Should not be null here.
-                successResults = [];
-                return (successResults, failureResults);
-            }
-            catch (SDKException se) when (se.StatusCode == 404)
-            {
-                // We know we've got an issue now.
-                opaSupportsBatchQueryAPI = false;
-                LogMessages.LogBatchQueryFallback(_logger);
-                // Fall-through to the "unsupported" case.
-            }
-        }
-        // Implicitly rethrow all other exceptions.
-
-        // Fall back to sequential queries against the OPA instance.
-        if (!opaSupportsBatchQueryAPI)
-        {
-            successResults = [];
-            failureResults = [];
-            foreach (var (key, value) in inputs)
-            {
-                try
-                {
-                    var res = await EvalPolicySingle(path, Input.CreateMapOfAny(value));
-                    successResults.Add(key, ConvertResult<T>(res.SuccessfulPolicyResponse!.Result!));
-                }
-                catch (ClientError)
-                {
-                    throw; // Rethrow for the caller to deal with. Request was malformed.
-                }
-                catch (OpenPolicyAgent.Opa.OpenApi.Models.Errors.ServerError se)
-                {
-                    failureResults.Add(key, (OpaError)se);
-                }
-                // Implicitly rethrow all other exceptions.
-            }
-
-            // If we have the mixed case, add the HttpStatusCode fields.
-            if (successResults.Count > 0 && failureResults.Count > 0)
-            {
-                // Modifying the dictionary element while iterating is a language feature since 2020, apparently.
-                // Ref: https://github.com/dotnet/runtime/pull/34667
-                foreach (var key in failureResults.Keys)
-                {
-                    failureResults[key].HttpStatusCode = "500";
-                }
-            }
-
-            return (successResults, failureResults);
-        }
-
-        // This *should* never happen. It means we didn't return from the batch or fallback handler blocks earlier.
-        throw new Exception("Impossible error");
-    }
-
-    /// <exclude />
-    // Used for the fallback version of QueryMachineryBatch.
-    private async Task<ExecutePolicyWithInputResponse> EvalPolicySingle(string path, Input input)
-    {
-        var req = new ExecutePolicyWithInputRequest()
-        {
-            Path = path,
-            RequestBody = new ExecutePolicyWithInputRequestBody()
-            {
-                Input = input
-            },
-            Pretty = requestPretty,
-            Provenance = requestProvenance,
-            Explain = requestExplain,
-            Metrics = requestMetrics,
-            Instrument = requestInstrument,
-            StrictBuiltinErrors = requestStrictBuiltinErrors,
-        };
-
-        return await opa.ExecutePolicyWithInputAsync(req);
-    }
-
-    /// <summary>
-    /// Uses EOPA's Compile API to partially evaluate a data
-    /// filter policy. Results are returned as a tuple with the members:
-    /// <list type="bullet">
-    ///     <item>Data Filters (UCAST or SQL)</item>
-    ///     <item>Column Masking Rules</item>
-    /// </list>
-    /// </summary>
-    /// <param name="path">The rule to use for generating data filters. (Example: "app/rbac")</param>
-    /// <param name="input">The input C# object OPA will use for evaluating the data filter policy.</param>
-    /// <param name="unknowns">The unknowns to use in partial evaluation of the data filter policy.</param>
-    /// <param name="tableMappings">The mappings between tables and columns that should be used for generating the data filters.</param>
-    /// <param name="targetDialect">The specific dialect of data filters to generate. (default: UCAST-LINQ dialect)</param>
-    /// <param name="jsonSerializerSettings">The Newtonsoft.Json.JsonSerializerSettings object to use for round-tripping the input through JSON serdes. (default: global serializer settings, if any)</param>
-    /// <returns>A ValueTuple of data filters (UCAST nodes or SQL) and column masking rules (if present).</returns>
-    /// <exception cref="OpaException"></exception>
-    /// <remarks>See: <see href="https://www.openpolicyagent.org/docs/rest-api#compile-api"/></remarks>
-    public async Task<(IFilter, ColumnMasks?)> GetFilters(string path, object? input, List<string>? unknowns = null, Filters.TargetSQLTableMappings? tableMappings = null, Filters.TargetDialects targetDialect = Filters.TargetDialects.UcastLinq, JsonSerializerSettings? jsonSerializerSettings = null)
-    {
-        if (input is null)
-        {
-            return await CompileMachinerySingle(path, Input.CreateNull(), unknowns, tableMappings, targetDialect);
-        }
-        // Round-trip through JSON conversion, such that it becomes an Input.
-        var jsonInput = JsonConvert.SerializeObject(input, jsonSerializerSettings ?? _jsonSerializerSettings);
-        var roundTrippedInput = JsonConvert.DeserializeObject<Input>(jsonInput, jsonSerializerSettings ?? _jsonSerializerSettings) ?? throw new OpaException(string.Format("could not convert object type to a valid OPA input"));
-
-        return await CompileMachinerySingle(path, roundTrippedInput, unknowns, tableMappings, targetDialect);
-    }
-
-    /// <summary>
-    /// Uses EOPA's Compile API to partially evaluate a data
-    /// filter policy. Results are returned as a Dictionary pairing filter types to the generated data filters.
-    /// Each data filtering result has the form:
-    /// <list type="bullet">
-    ///     <item>Data Filters (UCAST or SQL)</item>
-    ///     <item>Column Masking Rules</item>
-    /// </list>
-    /// This is intentionally similar to the results of calling <see cref="GetFilters"/> multiple times in a row, and allows efficient retrieval of multiple data filter types if needed.
-    /// </summary>
-    /// <param name="path">The rule to use for generating data filters. (Example: "app/rbac")</param>
-    /// <param name="input">The input C# object OPA will use for evaluating the data filter policy.</param>
-    /// <param name="unknowns">The unknowns to use in partial evaluation of the data filter policy.</param>
-    /// <param name="tableMappings">The mappings between tables and columns that should be used for generating the data filters.</param>
-    /// <param name="targetDialects">The dialects of data filters to generate. (default: UCAST-LINQ dialect)</param>
-    /// <param name="jsonSerializerSettings">The Newtonsoft.Json.JsonSerializerSettings object to use for round-tripping the input through JSON serdes. (default: global serializer settings, if any)</param>
-    /// <returns>A ValueTuple of data filters (UCAST nodes or SQL) and column masking rules (if present).</returns>
-    /// <exception cref="OpaException"></exception>
-    /// <remarks>See: <see href="https://www.openpolicyagent.org/docs/rest-api#compile-api"/></remarks>
-    public async Task<(Dictionary<string, IFilter>, ColumnMasks?)> GetMultipleFilters(string path, object? input, List<string>? unknowns = null, Filters.TargetSQLTableMappings? tableMappings = null, List<Filters.TargetDialects>? targetDialects = null, JsonSerializerSettings? jsonSerializerSettings = null)
-    {
-        if (input is null)
-        {
-            return await CompileMachineryMulti(path, Input.CreateNull(), unknowns, tableMappings, targetDialects);
-        }
-        // Round-trip through JSON conversion, such that it becomes an Input.
-        var jsonInput = JsonConvert.SerializeObject(input, jsonSerializerSettings ?? _jsonSerializerSettings);
-        var roundTrippedInput = JsonConvert.DeserializeObject<Input>(jsonInput, jsonSerializerSettings ?? _jsonSerializerSettings) ?? throw new OpaException(string.Format("could not convert object type to a valid OPA input"));
-
-        return await CompileMachineryMulti(path, roundTrippedInput, unknowns, tableMappings, targetDialects);
-    }
-
-    /// <exclude />
-    // Note(philip): This method allows us to hide the implementation of the
-    // `/v1/compile/{path}` query, and will be swapped out for a call into the
-    // Speakeasy-generated SDK once upstream bugfixes land.
-    private async Task<(IFilter, ColumnMasks?)> CompileMachinerySingle(string path, Input input, List<string>? unknowns = null, Filters.TargetSQLTableMappings? tableMappings = null, Filters.TargetDialects targetDialect = Filters.TargetDialects.UcastLinq)
-    {
-        var (compileURL, jsonContent, acceptHeader) = BuildCompileRequest(path, input, unknowns, tableMappings, [targetDialect]);
-
+        var opts = DefaultOptions;
+        opts.Provenance = provenance;
+        opts.Metrics = metrics;
+        EvalEnvelope env;
         try
         {
-            using var client = new HttpClient();
-            // Set custom Accept header
-            client.DefaultRequestHeaders.Accept.Clear();
-            client.DefaultRequestHeaders.Accept.Add(
-                new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue(acceptHeader));
+            env = await _http.EvaluateAsync(path, MaybeRoundTrip(input, jsonSerializerSettings), opts, ct).ConfigureAwait(false);
+        }
+        catch (OpaException e)
+        {
+            LogMessages.LogQueryError(_logger, path, e.Message);
+            throw;
+        }
+        return new OpaResult<T>
+        {
+            Value = env.RawResultJson is null ? default : _defaultSerializer.Deserialize<T>(env.RawResultJson),
+            DecisionId = env.DecisionId,
+            Metrics = env.RawMetricsJson is null ? null : JsonConvert.DeserializeObject<Dictionary<string, object>>(env.RawMetricsJson),
+            Provenance = env.RawProvenanceJson is null ? null : JsonConvert.DeserializeObject<OpaProvenance>(env.RawProvenanceJson),
+            StatusCode = 200,
+        };
+    }
 
-            _logger.LogDebug(string.Format("{0}", jsonContent)); // DEBUG
-            var content = new StringContent(jsonContent, System.Text.Encoding.UTF8, "application/json");
+    // ---------- batch-eval high-level API ----------
 
-            // Send the POST request asynchronously
-            var response = await client.PostAsync(compileURL, content);
-
-            // Read response content
-            var responseContent = await response.Content.ReadAsStringAsync();
-            _logger.LogDebug(string.Format("{0}", responseContent)); // DEBUG
-
-            // Handle different status codes
-            if (response.IsSuccessStatusCode) // 200 OK
+    /// <summary>
+    /// Evaluate a policy against a map of inputs. Each entry in the returned
+    /// dictionary is either a successful evaluation (<see cref="OpaBatchEntry{T}.IsSuccess"/>
+    /// is true, <see cref="OpaBatchEntry{T}.Value"/> populated) or a failure
+    /// (<see cref="OpaBatchEntry{T}.Error"/> populated).
+    /// </summary>
+    /// <remarks>
+    /// When the OPA server does not support the <c>/v1/batch/data</c> endpoint
+    /// (vanilla OSS OPA returns 404), the client transparently falls back to
+    /// running each input as a sequential single-policy query and reconstructs
+    /// the same result shape. The fallback is sticky for the lifetime of this
+    /// client.
+    ///
+    /// Use the <see cref="OpaBatchExtensions.Successes{T}"/> /
+    /// <see cref="OpaBatchExtensions.Failures{T}"/> helpers to filter the result
+    /// dictionary down to one side at a time.
+    /// </remarks>
+    /// <typeparam name="T">The type to deserialize each successful policy result into.</typeparam>
+    /// <param name="path">The rule to evaluate.</param>
+    /// <param name="inputs">Map of caller-supplied input ids to input values.</param>
+    public async Task<Dictionary<string, OpaBatchEntry<T>>> EvaluateBatch<T>(string path, IDictionary<string, object?> inputs)
+    {
+        if (_opaSupportsBatchQueryAPI)
+        {
+            try
             {
-                return targetDialect switch
+                var batch = await _http.EvaluateBatchAsync(path, inputs, DefaultOptions).ConfigureAwait(false);
+                return BatchToEntries<T>(batch);
+            }
+            catch (OpaPolicyException ex) when (ex.StatusCode == 404)
+            {
+                _opaSupportsBatchQueryAPI = false;
+                LogMessages.LogBatchQueryFallback(_logger);
+            }
+            catch (OpaServerException ex) when (ex.BatchQueryErrors is not null)
+            {
+                var entries = new Dictionary<string, OpaBatchEntry<T>>(ex.BatchQueryErrors.Count);
+                foreach (var kv in ex.BatchQueryErrors)
                 {
-                    Filters.TargetDialects.UcastAll => BuildCompileResultUCAST(path, responseContent, targetDialect),
-                    Filters.TargetDialects.UcastMinimal => BuildCompileResultUCAST(path, responseContent, targetDialect),
-                    Filters.TargetDialects.UcastPrisma => BuildCompileResultUCAST(path, responseContent, targetDialect),
-                    Filters.TargetDialects.UcastLinq => BuildCompileResultUCAST(path, responseContent, targetDialect),
-                    Filters.TargetDialects.SqlSqlserver => BuildCompileResultSQL(path, responseContent, targetDialect),
-                    Filters.TargetDialects.SqlMysql => BuildCompileResultSQL(path, responseContent, targetDialect),
-                    Filters.TargetDialects.SqlPostgresql => BuildCompileResultSQL(path, responseContent, targetDialect),
-                    Filters.TargetDialects.SqlSqlite => BuildCompileResultSQL(path, responseContent, targetDialect),
-                    _ => throw new NotImplementedException(),
+                    entries[kv.Key] = new OpaBatchEntry<T> { IsSuccess = false, Error = kv.Value };
+                }
+                return entries;
+            }
+            // Other OpaPolicyException / OpaServerException variants propagate up.
+        }
+
+        return await BatchFallbackAsync<T>(path, inputs).ConfigureAwait(false);
+    }
+
+    private async Task<Dictionary<string, OpaBatchEntry<T>>> BatchFallbackAsync<T>(string path, IDictionary<string, object?> inputs)
+    {
+        var results = new Dictionary<string, OpaBatchEntry<T>>(inputs.Count);
+        bool sawSuccess = false, sawFailure = false;
+        foreach (var kv in inputs)
+        {
+            try
+            {
+                var env = await _http.EvaluateAsync(path, kv.Value, DefaultOptions).ConfigureAwait(false);
+                var v = env.RawResultJson is null ? default : _defaultSerializer.Deserialize<T>(env.RawResultJson);
+                results[kv.Key] = new OpaBatchEntry<T>
+                {
+                    IsSuccess = true,
+                    Value = v,
+                    DecisionId = env.DecisionId,
+                };
+                sawSuccess = true;
+            }
+            catch (OpaServerException ex)
+            {
+                results[kv.Key] = new OpaBatchEntry<T>
+                {
+                    IsSuccess = false,
+                    Error = new OpaError
+                    {
+                        Code = ex.Code ?? "internal_error",
+                        Message = ex.Message ?? "",
+                        DecisionId = ex.DecisionId,
+                    },
+                };
+                sawFailure = true;
+            }
+            // OpaPolicyException (4xx) propagates: a malformed request is fatal for the whole batch.
+        }
+        // For mixed results, surface explicit per-entry status codes for symmetry with the EOPA endpoint's 207 response.
+        if (sawSuccess && sawFailure)
+        {
+            foreach (var key in results.Keys.ToList())
+            {
+                var prev = results[key];
+                results[key] = prev.IsSuccess
+                    ? new OpaBatchEntry<T> { IsSuccess = true, Value = prev.Value, DecisionId = prev.DecisionId, Metrics = prev.Metrics, Provenance = prev.Provenance, StatusCode = 200 }
+                    : new OpaBatchEntry<T> { IsSuccess = false, Error = new OpaError { Code = prev.Error!.Code, Message = prev.Error.Message, DecisionId = prev.Error.DecisionId, StatusCode = 500 }, StatusCode = 500 };
+            }
+        }
+        return results;
+    }
+
+    private Dictionary<string, OpaBatchEntry<T>> BatchToEntries<T>(BatchEnvelope batch)
+    {
+        var results = new Dictionary<string, OpaBatchEntry<T>>(batch.Entries.Count);
+        bool mixed = batch.StatusCode == 207;
+        foreach (var kv in batch.Entries)
+        {
+            var raw = kv.Value;
+            if (raw.StatusCode == 200)
+            {
+                var v = raw.RawResultJson is null ? default : _defaultSerializer.Deserialize<T>(raw.RawResultJson);
+                results[kv.Key] = new OpaBatchEntry<T>
+                {
+                    IsSuccess = true,
+                    Value = v,
+                    StatusCode = mixed ? 200 : null,
+                    DecisionId = raw.DecisionId,
+                    Metrics = raw.RawMetricsJson is null ? null : JsonConvert.DeserializeObject<Dictionary<string, object>>(raw.RawMetricsJson),
+                    Provenance = raw.RawProvenanceJson is null ? null : JsonConvert.DeserializeObject<OpaProvenance>(raw.RawProvenanceJson),
                 };
             }
-            else if (response.StatusCode == System.Net.HttpStatusCode.BadRequest) // 400
-            {
-                throw new Exception($"Bad request: {responseContent}");
-            }
-            else if (response.StatusCode == System.Net.HttpStatusCode.InternalServerError) // 500
-            {
-                throw new Exception($"Server error: {responseContent}");
-            }
             else
             {
-                throw new Exception($"Unexpected status code: {response.StatusCode}, Response: {responseContent}");
+                results[kv.Key] = new OpaBatchEntry<T>
+                {
+                    IsSuccess = false,
+                    StatusCode = mixed ? raw.StatusCode : null,
+                    Error = new OpaError
+                    {
+                        Code = raw.Code ?? "internal_error",
+                        Message = raw.Message ?? "",
+                        DecisionId = raw.DecisionId,
+                        StatusCode = mixed ? raw.StatusCode : null,
+                    },
+                };
             }
         }
-        catch (Exception ex)
-        {
-            throw new Exception($"Error during HTTP request: {ex.Message}", ex);
-        }
+        return results;
     }
 
-    /// <exclude />
-    // Note(philip): This method allows us to hide the implementation of the
-    // `/v1/compile/{path}` query, and will be swapped out for a call into the
-    // Speakeasy-generated SDK once upstream bugfixes land.
-    private async Task<(Dictionary<string, IFilter>, ColumnMasks?)> CompileMachineryMulti(string path, Input input, List<string>? unknowns = null, Filters.TargetSQLTableMappings? tableMappings = null, List<Filters.TargetDialects>? targetDialects = null)
+    // ---------- compile / data filters ----------
+
+    /// <summary>
+    /// Uses EOPA's Compile API to partially evaluate a data filter policy.
+    /// </summary>
+    public async Task<(IFilter, ColumnMasks?)> GetFilters(
+        string path,
+        object? input,
+        List<string>? unknowns = null,
+        Filters.TargetSQLTableMappings? tableMappings = null,
+        Filters.TargetDialects targetDialect = Filters.TargetDialects.UcastLinq,
+        JsonSerializerSettings? jsonSerializerSettings = null)
     {
-        // Default dialect is UCAST-Linq.
-        targetDialects ??= [Filters.TargetDialects.UcastLinq];
-
-        var (compileURL, jsonContent, acceptHeader) = BuildCompileRequest(path, input, unknowns, tableMappings, targetDialects);
-
-        try
+        var (jsonContent, acceptHeader) = BuildCompilePayload(input, unknowns, tableMappings, [targetDialect], jsonSerializerSettings);
+        var (_, _, body) = await _http.CompileAsync(path, jsonContent, acceptHeader, DefaultOptions).ConfigureAwait(false);
+        return targetDialect switch
         {
-            using var client = new HttpClient();
-            // Set custom Accept header
-            client.DefaultRequestHeaders.Accept.Clear();
-            client.DefaultRequestHeaders.Accept.Add(
-                new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue(acceptHeader));
-
-            _logger.LogDebug(string.Format("{0}", jsonContent)); // DEBUG
-            var content = new StringContent(jsonContent, System.Text.Encoding.UTF8, "application/json");
-
-            // Send the POST request asynchronously
-            var response = await client.PostAsync(compileURL, content);
-
-            // Read response content
-            var responseContent = await response.Content.ReadAsStringAsync();
-            _logger.LogDebug(string.Format("{0}", responseContent)); // DEBUG
-
-            // Handle different status codes
-            if (response.IsSuccessStatusCode) // 200 OK
-            {
-                var result = JsonConvert.DeserializeObject<CompileResultMultitargetRecord>(responseContent);
-                if (result is null)
-                {
-                    LogMessages.LogQueryNullResult(_logger, path);
-                    var msg = string.Format("executing policy at '{0}' succeeded, but OPA did not reply with valid data filters", path);
-                    throw new OpaException(msg);
-                }
-
-                // Build up output dictionary.
-                Dictionary<string, IFilter> queries = new(targetDialects.Count);
-                ColumnMasks? masks = null; // Assumption: Masks *should* remain identical across all returned masks.
-                foreach (var dialect in targetDialects)
-                {
-                    switch (dialect)
-                    {
-                        case Filters.TargetDialects.UcastAll:
-                        case Filters.TargetDialects.UcastMinimal:
-                        case Filters.TargetDialects.UcastPrisma:
-                        case Filters.TargetDialects.UcastLinq:
-                            if (result.Result.Ucast is not null)
-                            {
-                                queries["ucast"] = new UCASTFilter(result.Result.Ucast.Query);
-                            }
-                            masks ??= result.Result.Ucast?.Masks;
-                            break;
-                        case Filters.TargetDialects.SqlPostgresql:
-                            queries["postgresql"] = new SQLFilter(result.Result.PostgreSql?.Query ?? "", "postgresql");
-                            masks ??= result.Result.PostgreSql?.Masks;
-                            break;
-                        case Filters.TargetDialects.SqlMysql:
-                            queries["mysql"] = new SQLFilter(result.Result.MySql?.Query ?? "", "mysql");
-                            masks ??= result.Result.MySql?.Masks;
-                            break;
-                        case Filters.TargetDialects.SqlSqlserver:
-                            queries["sqlserver"] = new SQLFilter(result.Result.SqlServer?.Query ?? "", "sqlserver");
-                            masks ??= result.Result.SqlServer?.Masks;
-                            break;
-                        case Filters.TargetDialects.SqlSqlite:
-                            queries["sqlite"] = new SQLFilter(result.Result.Sqlite?.Query ?? "", "sqlserver");
-                            masks ??= result.Result.Sqlite?.Masks;
-                            break;
-                    }
-                }
-                return (queries, masks);
-            }
-            else if (response.StatusCode == System.Net.HttpStatusCode.BadRequest) // 400
-            {
-                throw new Exception($"Bad request: {responseContent}");
-            }
-            else if (response.StatusCode == System.Net.HttpStatusCode.InternalServerError) // 500
-            {
-                throw new Exception($"Server error: {responseContent}");
-            }
-            else
-            {
-                throw new Exception($"Unexpected status code: {response.StatusCode}, Response: {responseContent}");
-            }
-        }
-        catch (Exception ex)
-        {
-            throw new Exception($"Error during HTTP request: {ex.Message}", ex);
-        }
+            Filters.TargetDialects.UcastAll or Filters.TargetDialects.UcastMinimal or Filters.TargetDialects.UcastPrisma or Filters.TargetDialects.UcastLinq
+                => BuildCompileResultUCAST(path, body, targetDialect),
+            Filters.TargetDialects.SqlSqlserver or Filters.TargetDialects.SqlMysql or Filters.TargetDialects.SqlPostgresql or Filters.TargetDialects.SqlSqlite
+                => BuildCompileResultSQL(path, body, targetDialect),
+            _ => throw new NotImplementedException(),
+        };
     }
 
     /// <summary>
-    /// Generates the URL, JSON payload, and <c>Accept</c> header string for <see cref="GetFilters"/> and <see cref="GetMultipleFilters"/> requests.
+    /// Uses EOPA's Compile API for multi-target partial evaluation.
     /// </summary>
-    /// <param name="path">The policy path to use for the Compile API.</param>
-    /// <param name="input">The Speakeasy SDK Input type to use for the <c>input</c> part of the JSON request payload.</param>
-    /// <param name="unknowns">A list of unknowns to use for the <c>unknowns</c> part of the JSON request payload.</param>
-    /// <param name="tableMappings">An object describing table/column mappings for the different database types.</param>
-    /// <param name="targetDialects">A list of target dialects to generate data filters for. If more than one target dialect is provided, the multitarget <c>Accept</c> header and <c>options.targetDialects</c> payload field will be generated.</param>
-    /// <returns>A ValueTuple of (URL, JSON payload string, and <c>Accept</c> header).</returns>
-    private (string, string, string) BuildCompileRequest(string path, Input input, List<string>? unknowns = null, Filters.TargetSQLTableMappings? tableMappings = null, List<Filters.TargetDialects>? targetDialects = null)
+    public async Task<(Dictionary<string, IFilter>, ColumnMasks?)> GetMultipleFilters(
+        string path,
+        object? input,
+        List<string>? unknowns = null,
+        Filters.TargetSQLTableMappings? tableMappings = null,
+        List<Filters.TargetDialects>? targetDialects = null,
+        JsonSerializerSettings? jsonSerializerSettings = null)
     {
-        // Build URL manually, emulating the query parameter wrangling Speakeasy would normally do for us.
-        var compileURL = $"{_serverUrl}/v1/compile/{path}";
-        var urlParams = new Dictionary<string, string>
-        {
-            { "pretty", requestPretty.ToString().ToLower() },
-            { "provenance", requestProvenance.ToString().ToLower() },
-            { "explain", requestExplain.ToString().ToLower() },
-            { "metrics", requestMetrics.ToString().ToLower() },
-            { "instrument", requestInstrument.ToString().ToLower() },
-            { "strict-builtin-errors" ,requestStrictBuiltinErrors.ToString().ToLower() },
-        };
-        string queryString = "?" + string.Join("&", urlParams.Select(p => $"{HttpUtility.UrlEncode(p.Key)}={HttpUtility.UrlEncode(p.Value)}"));
-        if (queryString != "?") { compileURL += queryString; }
-        _logger.LogDebug(string.Format("{0}", compileURL));
-
-        // Default dialect is `ucast+linq`.
         targetDialects ??= [Filters.TargetDialects.UcastLinq];
-        var isMultiTarget = targetDialects.Count > 1;
+        var (jsonContent, acceptHeader) = BuildCompilePayload(input, unknowns, tableMappings, targetDialects, jsonSerializerSettings);
+        var (_, _, body) = await _http.CompileAsync(path, jsonContent, acceptHeader, DefaultOptions).ConfigureAwait(false);
 
-        // Decide the Accept header, based on dialect choice.
-        string acceptHeader = targetDialects.Count switch
+        var result = JsonConvert.DeserializeObject<CompileResultMultitargetRecord>(body)
+            ?? throw new OpaException($"executing policy at '{path}' succeeded, but OPA did not reply with valid data filters");
+
+        var queries = new Dictionary<string, IFilter>(targetDialects.Count);
+        ColumnMasks? masks = null;
+        foreach (var dialect in targetDialects)
+        {
+            switch (dialect)
+            {
+                case Filters.TargetDialects.UcastAll:
+                case Filters.TargetDialects.UcastMinimal:
+                case Filters.TargetDialects.UcastPrisma:
+                case Filters.TargetDialects.UcastLinq:
+                    if (result.Result.Ucast is not null) queries["ucast"] = new UCASTFilter(result.Result.Ucast.Query);
+                    masks ??= result.Result.Ucast?.Masks;
+                    break;
+                case Filters.TargetDialects.SqlPostgresql:
+                    queries["postgresql"] = new SQLFilter(result.Result.PostgreSql?.Query ?? "", "postgresql");
+                    masks ??= result.Result.PostgreSql?.Masks;
+                    break;
+                case Filters.TargetDialects.SqlMysql:
+                    queries["mysql"] = new SQLFilter(result.Result.MySql?.Query ?? "", "mysql");
+                    masks ??= result.Result.MySql?.Masks;
+                    break;
+                case Filters.TargetDialects.SqlSqlserver:
+                    queries["sqlserver"] = new SQLFilter(result.Result.SqlServer?.Query ?? "", "sqlserver");
+                    masks ??= result.Result.SqlServer?.Masks;
+                    break;
+                case Filters.TargetDialects.SqlSqlite:
+                    queries["sqlite"] = new SQLFilter(result.Result.Sqlite?.Query ?? "", "sqlserver");
+                    masks ??= result.Result.Sqlite?.Masks;
+                    break;
+            }
+        }
+        return (queries, masks);
+    }
+
+    private (string jsonContent, string acceptHeader) BuildCompilePayload(
+        object? input,
+        List<string>? unknowns,
+        Filters.TargetSQLTableMappings? tableMappings,
+        List<Filters.TargetDialects> targetDialects,
+        JsonSerializerSettings? jsonSerializerSettings)
+    {
+        var acceptHeader = targetDialects.Count switch
         {
             1 => targetDialects[0].ToAcceptHeader(),
             _ => "application/vnd.opa.multitarget+json",
         };
-
-        // Serialize request object to JSON
-        var reqObj = new Dictionary<string, object> {
-            { "input", input },
-        };
-        if (unknowns is not null) { reqObj.Add("unknowns", unknowns); }
-        // Handle options cases:
+        var reqObj = new Dictionary<string, object?> { { "input", input } };
+        if (unknowns is not null) reqObj.Add("unknowns", unknowns);
         if (tableMappings is not null || targetDialects.Count > 1)
         {
             var options = new Dictionary<string, object>(2);
-            if (tableMappings is not null) { options.Add("tableMappings", tableMappings); }
-            if (targetDialects.Count > 1) { options.Add("targetDialects", targetDialects.Select(x => x.ToOptionString()).ToList()); }
+            if (tableMappings is not null) options.Add("tableMappings", tableMappings);
+            if (targetDialects.Count > 1) options.Add("targetDialects", targetDialects.Select(x => x.ToOptionString()).ToList());
             reqObj.Add("options", options);
         }
-
-        var jsonContent = JsonConvert.SerializeObject(reqObj);
-
-        return (compileURL, jsonContent, acceptHeader);
+        // Compile API payloads always go through Newtonsoft because the filter result types
+        // (UCASTNode, MaskingTypes) are decorated with Newtonsoft-specific converters.
+        return (JsonConvert.SerializeObject(reqObj, jsonSerializerSettings), acceptHeader);
     }
 
-    /// <summary>
-    /// Assembles a ValueTuple of UCAST data filter and ColumnMasks from a JSON Compile API response.
-    /// </summary>
-    /// <param name="path">Policy path used to generate the filter. Used mostly for informative error logs.</param>
-    /// <param name="response">The JSON response string.</param>
-    /// <param name="dialect">The data filter dialect used to generate the filter. Used mostly for validation.</param>
-    /// <returns>A ValueTuple of the form (UCAST data filter, Column masks).</returns>
-    /// <exception cref="OpaException"></exception>
-    /// <exception cref="NotImplementedException"></exception>
     private (IFilter, ColumnMasks?) BuildCompileResultUCAST(string path, string response, Filters.TargetDialects dialect)
     {
-        var result = JsonConvert.DeserializeObject<CompileResultUCASTRecord>(response);
-        if (result is null)
+        var result = JsonConvert.DeserializeObject<CompileResultUCASTRecord>(response)
+            ?? throw new OpaException($"executing policy at '{path}' succeeded, but OPA did not reply with valid data filters");
+        IFilter query = dialect switch
         {
-            LogMessages.LogQueryNullResult(_logger, path);
-            var msg = string.Format("executing policy at '{0}' succeeded, but OPA did not reply with valid data filters", path);
-            throw new OpaException(msg);
-        }
-
-        IFilter? query = dialect switch
-        {
-            Filters.TargetDialects.UcastAll => new UCASTFilter(result.Result.Query),
-            Filters.TargetDialects.UcastMinimal => new UCASTFilter(result.Result.Query),
-            Filters.TargetDialects.UcastPrisma => new UCASTFilter(result.Result.Query),
-            Filters.TargetDialects.UcastLinq => new UCASTFilter(result.Result.Query),
+            Filters.TargetDialects.UcastAll or Filters.TargetDialects.UcastMinimal or Filters.TargetDialects.UcastPrisma or Filters.TargetDialects.UcastLinq
+                => new UCASTFilter(result.Result.Query),
             _ => throw new NotImplementedException(),
         };
-
         return (query, result.Result.Masks);
     }
 
-    /// <summary>
-    /// Assembles a ValueTuple of SQL data filter and ColumnMasks from a JSON Compile API response.
-    /// </summary>
-    /// <param name="path">Policy path used to generate the filter. Used mostly for informative error logs.</param>
-    /// <param name="response">The JSON response string.</param>
-    /// <param name="dialect">The data filter dialect used to generate the filter. Used mostly for validation.</param>
-    /// <returns>A ValueTuple of the form (SQL data filter, Column masks).</returns>
-    /// <returns>A ValueTuple of the form (SQL data filter, Column masks).</returns>
-    /// <exception cref="OpaException"></exception>
-    /// <exception cref="NotImplementedException"></exception>
     private (IFilter, ColumnMasks?) BuildCompileResultSQL(string path, string response, Filters.TargetDialects dialect)
     {
-        var result = JsonConvert.DeserializeObject<CompileResultSQLRecord>(response);
-        if (result is null)
+        var result = JsonConvert.DeserializeObject<CompileResultSQLRecord>(response)
+            ?? throw new OpaException($"executing policy at '{path}' succeeded, but OPA did not reply with valid data filters");
+        IFilter query = dialect switch
         {
-            LogMessages.LogQueryNullResult(_logger, path);
-            var msg = string.Format("executing policy at '{0}' succeeded, but OPA did not reply with valid data filters", path);
-            throw new OpaException(msg);
-        }
-
-        IFilter? query = dialect switch
-        {
-            Filters.TargetDialects.SqlPostgresql => new SQLFilter(result.Result.Query, dialect.ToOptionString()),
-            Filters.TargetDialects.SqlMysql => new SQLFilter(result.Result.Query, dialect.ToOptionString()),
-            Filters.TargetDialects.SqlSqlserver => new SQLFilter(result.Result.Query, dialect.ToOptionString()),
-            Filters.TargetDialects.SqlSqlite => new SQLFilter(result.Result.Query, dialect.ToOptionString()),
+            Filters.TargetDialects.SqlPostgresql or Filters.TargetDialects.SqlMysql or Filters.TargetDialects.SqlSqlserver or Filters.TargetDialects.SqlSqlite
+                => new SQLFilter(result.Result.Query, dialect.ToOptionString()),
             _ => throw new NotImplementedException(),
         };
-
         return (query, result.Result.Masks);
     }
 
-    /// <exclude />
-    // Designed to respect the nullability of the incoming generic type when possible.
-    protected internal static T ConvertResult<T>(Result resultValue)
-    {
-        // We check to see if T maps to any of the core JSON types.
-        // We do the type-switch here, so that high-level clients don't have to.
-        // Because the Result members are nullable types, we use type testing
-        // with pattern matching to extract a non-null instance of the value if
-        // it exists.
-        switch (resultValue.Type.ToString())
-        {
-            case "boolean":
-                if (resultValue.Boolean is T defBoolean) { return defBoolean; }
-                // If not a perfect match, we return null.
-                return IsNullable(typeof(T)) ? default! : throw new OpaException(string.Format("Could not convert bool result to type {0}", typeof(T).FullName));
-            case "number":
-                if (resultValue.Number is T defNumber) { return defNumber; }
-                // If not a perfect match, we return null.
-                return IsNullable(typeof(T)) ? default! : throw new OpaException(string.Format("Could not convert number result to type {0}", typeof(T).FullName));
-            case "str":
-                if (resultValue.Str is T defStr) { return defStr; }
-                // If not a perfect match, we return null.
-                return IsNullable(typeof(T)) ? default! : throw new OpaException(string.Format("Could not convert string result to type {0}", typeof(T).FullName));
-            case "arrayOfAny":
-                if (resultValue.ArrayOfAny is T defArray) { return defArray; }
-                break; // Fall through to the JSON round-trip path.
-            case "mapOfAny":
-                if (resultValue.MapOfAny is T defObject) { return defObject; }
-                break; // Fall through to the JSON round-trip path.
-            case null:
-                return IsNullable(typeof(T)) ? default! : throw new OpaException(string.Format("Could not convert null result to type {0}", typeof(T).FullName));
-            default:
-                break;
-        }
+    // ---------- result coercion helpers ----------
 
-        // At this point, T must be a C# object type, and we'll attempt to
-        // deserialize to it.
+    private T CoerceResult<T>(string? rawResultJson, string path)
+    {
+        if (rawResultJson is null)
+        {
+            LogMessages.LogQueryNullResult(_logger, path);
+            throw new OpaException($"executing policy at '{path}' succeeded, but OPA did not reply with a result");
+        }
+        return DeserializeOrThrow<T>(rawResultJson);
+    }
+
+    private T CoerceDefault<T>(string? rawResultJson)
+    {
+        if (rawResultJson is null)
+        {
+            LogMessages.LogDefaultQueryNullResult(_logger);
+            throw new OpaException("executing server default policy succeeded, but OPA did not reply with a result");
+        }
+        return DeserializeOrThrow<T>(rawResultJson);
+    }
+
+    private T DeserializeOrThrow<T>(string rawJson)
+    {
         try
         {
-            var temp = JsonConvert.SerializeObject(resultValue);
-            var converted = JsonConvert.DeserializeObject<T>(temp);
-
-            if (converted is null)
+            var v = _defaultSerializer.Deserialize<T>(rawJson);
+            if (v is null)
             {
-                return IsNullable(typeof(T)) ? converted! : throw new OpaException(string.Format("Could not convert result array/object to type {0}", typeof(T).FullName));
+                if (IsNullable(typeof(T))) return default!;
+                throw new OpaException($"Could not convert result to type {typeof(T).FullName}");
             }
-
-            // Not null, successful conversion.
-            return converted;
+            return v;
         }
+        catch (OpaException) { throw; }
         catch (Exception e)
         {
-            throw new OpaException(string.Format("Exception occurred while converting result array/object to type {0}", typeof(T).FullName), e);
+            throw new OpaException($"Exception occurred while converting result to type {typeof(T).FullName}", e);
         }
     }
 
-    /// <exclude />
-    private static bool IsNullable(Type type) => Nullable.GetUnderlyingType(type) != null;
+    private static bool IsNullable(Type type) =>
+        !type.IsValueType || Nullable.GetUnderlyingType(type) != null;
+
+    // Round-trip arbitrary inputs through the per-call settings if they were supplied.
+    // Per-call settings only affect input serialization; result deserialization always
+    // goes through the configured default serializer.
+    private static object? MaybeRoundTrip(object? input, JsonSerializerSettings? perCallSettings)
+    {
+        if (input is null) return null;
+        if (perCallSettings is null) return input;
+        var json = JsonConvert.SerializeObject(input, perCallSettings);
+        return JsonConvert.DeserializeObject<object>(json, perCallSettings);
+    }
 }

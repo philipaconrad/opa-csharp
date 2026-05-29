@@ -1,8 +1,8 @@
-﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using OpenPolicyAgent.Opa;
 using OpenPolicyAgent.Opa.Filters;
-using OpenPolicyAgent.Opa.OpenApi.Models.Components;
+using OpenPolicyAgent.Opa.Serialization;
 using OpenPolicyAgent.Ucast.Linq;
 
 namespace SmokeTest.Tests;
@@ -40,7 +40,6 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
 
   private class CustomRBACInputObject
   {
-
     [JsonProperty("user")]
     public string? User;
 
@@ -80,37 +79,14 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
     _testOutput = output;
   }
 
-  private OpaClient GetOpaClient()
-  {
-    // Construct the request URI by specifying the scheme, hostname, assigned random host port, and the endpoint "uuid".
-    var requestUri = new UriBuilder(Uri.UriSchemeHttp, _containerOpa.Hostname, _containerOpa.GetMappedPublicPort(8181)).Uri;
-    return new OpaClient(serverUrl: requestUri.ToString());
-  }
+  private string OpaUrl() => new UriBuilder(Uri.UriSchemeHttp, _containerOpa.Hostname, _containerOpa.GetMappedPublicPort(8181)).Uri.ToString();
+  private string EOpaUrl() => new UriBuilder(Uri.UriSchemeHttp, _containerEopa.Hostname, _containerEopa.GetMappedPublicPort(8181)).Uri.ToString();
 
-  private OpaClient GetOpaClientWithLogger(ILogger<OpaClient> logger)
-  {
-    var requestUri = new UriBuilder(Uri.UriSchemeHttp, _containerOpa.Hostname, _containerOpa.GetMappedPublicPort(8181)).Uri;
-    return new OpaClient(serverUrl: requestUri.ToString(), logger: logger);
-  }
+  private OpaClient GetOpaClient() => new(serverUrl: OpaUrl());
+  private OpaClient GetOpaClientWithLogger(ILogger<OpaClient> logger) => new(serverUrl: OpaUrl(), logger: logger);
+  private OpaClient GetEOpaClient() => new(serverUrl: EOpaUrl());
 
-  private OpaClient GetEOpaClient()
-  {
-    var requestUri = new UriBuilder(Uri.UriSchemeHttp, _containerEopa.Hostname, _containerEopa.GetMappedPublicPort(8181)).Uri;
-    return new OpaClient(serverUrl: requestUri.ToString());
-  }
-
-  private OpaClient GetEOpaClientWithLogger(ILogger<OpaClient> logger)
-  {
-    var requestUri = new UriBuilder(Uri.UriSchemeHttp, _containerEopa.Hostname, _containerEopa.GetMappedPublicPort(8181)).Uri;
-    return new OpaClient(serverUrl: requestUri.ToString(), logger: logger);
-  }
-
-  private bool NoEOPALicenseEnvVarsFound()
-  {
-    var key = Environment.GetEnvironmentVariable("EOPA_LICENSE_KEY") ?? "";
-    var token = Environment.GetEnvironmentVariable("EOPA_LICENSE_TOKEN") ?? "";
-    return key == "" && token == "";
-  }
+  // ---------- single-eval tests ----------
 
   [Fact]
   public async Task RBACCheckDictionaryTest()
@@ -124,8 +100,6 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
       { "type", "dog" },
     });
 
-    // BUG: This can fail as long as Speakeasy generates the upstream SDK with
-    // deserializers occurring in the same ordering as the OpenAPI spec.
     Assert.True(allow);
   }
 
@@ -133,9 +107,7 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
   public async Task RBACCheckNullTest()
   {
     var client = GetOpaClient();
-
     var allow = await client.Check("app/rbac/allow", null);
-
     Assert.False(allow);
   }
 
@@ -143,9 +115,7 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
   public async Task RBACCheckBoolTest()
   {
     var client = GetOpaClient();
-
     var allow = await client.Check("app/rbac/allow", true);
-
     Assert.False(allow);
   }
 
@@ -153,9 +123,7 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
   public async Task RBACCheckDoubleTest()
   {
     var client = GetOpaClient();
-
     var allow = await client.Check("app/rbac/allow", 42);
-
     Assert.False(allow);
   }
 
@@ -163,9 +131,7 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
   public async Task RBACCheckStringTest()
   {
     var client = GetOpaClient();
-
     var allow = await client.Check("app/rbac/allow", "alice");
-
     Assert.False(allow);
   }
 
@@ -173,9 +139,7 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
   public async Task RBACCheckListObjTest()
   {
     var client = GetOpaClient();
-
     var allow = await client.Check("app/rbac/allow", new List<object>() { "A", "B", "C", "D" });
-
     Assert.False(allow);
   }
 
@@ -326,10 +290,7 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
   public async Task BadOutputTypeCoerceTest()
   {
     var client = GetOpaClient();
-
     var input = new CustomRBACInputObject() { User = "alice", Action = "read", Object = "id123", Type = "dog" };
-
-    // Attempt to coerce an object return type into a bool. This should always fail!
     await Assert.ThrowsAsync<OpaException>(async () => { var res = await client.Evaluate<bool>("app/rbac", input); });
   }
 
@@ -338,7 +299,7 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
   {
     var client = GetOpaClient();
 
-    var input = new { a = "A", b = (object)null!, c = 2 }; // We will ensure the null field is not serialized.
+    var input = new { a = "A", b = (object)null!, c = 2 };
 
     var result = new Dictionary<string, object>();
 
@@ -369,8 +330,6 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
   {
     var client = GetOpaClient();
 
-    // Relies on Newtonsoft.Json's default serialization rules. `object` is unused by
-    // the policy, thankfully, so we can get away with mangling that field's name.
     var input = new { user = "alice", action = "read", _object = "id123", type = "dog" };
 
     var result = new Dictionary<string, object>();
@@ -419,6 +378,51 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
   }
 
   [Fact]
+  public async Task EvaluateWithMetadataReturnsDecisionMetadataTest()
+  {
+    var client = GetOpaClient();
+
+    var input = new Dictionary<string, object>() {
+      { "user", "alice" },
+      { "action", "read" },
+      { "object", "id123" },
+      { "type", "dog" },
+    };
+
+    var res = await client.EvaluateWithMetadataAsync<bool>("app/rbac/allow", input, provenance: true, metrics: false, ct: TestContext.Current.CancellationToken);
+
+    Assert.True(res.Value);
+    Assert.NotNull(res.Provenance);
+    Assert.Equal(200, res.StatusCode);
+  }
+
+  // ---------- batch-eval tests ----------
+
+  // Helper: assert each entry in the result dict represents a successful eval with the expected value.
+  private static void AssertAllSuccess<T>(Dictionary<string, OpaBatchEntry<T>> results, IEnumerable<string> expectedKeys, T expectedValue)
+  {
+    foreach (var key in expectedKeys)
+    {
+      Assert.True(results.ContainsKey(key), $"missing key {key}");
+      var entry = results[key];
+      Assert.True(entry.IsSuccess, $"entry {key} should be a success");
+      Assert.Equal(expectedValue, entry.Value);
+      Assert.Null(entry.Error);
+    }
+    Assert.Equal(expectedKeys.Count(), results.Count);
+  }
+
+  // Helper: assert a single failure entry has the expected code/message and a 5xx status.
+  private static void AssertFailure(OpaBatchEntry<Dictionary<string, object>> entry, string expectedCode, string expectedMessageSubstring)
+  {
+    Assert.False(entry.IsSuccess);
+    Assert.Null(entry.Value);
+    Assert.NotNull(entry.Error);
+    Assert.Equal(expectedCode, entry.Error.Code);
+    Assert.Contains(expectedMessageSubstring, entry.Error.Message);
+  }
+
+  [Fact]
   public async Task RBACBatchAllSuccessTest()
   {
     var client = GetEOpaClient();
@@ -430,22 +434,14 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
       { "type", "dog" }
     };
 
-    var (successes, failures) = await client.EvaluateBatch("app/rbac/allow", new Dictionary<string, Dictionary<string, object>>() {
+    var results = await client.EvaluateBatch<bool>("app/rbac/allow", new Dictionary<string, object?>() {
       {"AAA", goodInput },
       {"BBB", goodInput },
       {"CCC", goodInput },
     });
 
-    var expSuccess = new OpaResult() { Result = Result.CreateBoolean(true) };
-
-    // Assert that the successes dictionary has all expected elements, and the
-    // failures dictionary is empty.
-    Assert.Equivalent(new Dictionary<string, OpaResult>() {
-      { "AAA", expSuccess },
-      { "BBB", expSuccess },
-      { "CCC", expSuccess },
-    }, successes);
-    Assert.Empty(failures);
+    AssertAllSuccess(results, ["AAA", "BBB", "CCC"], expectedValue: true);
+    Assert.Empty(results.Failures());
   }
 
   [Fact]
@@ -463,37 +459,25 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
       { "y", new List<int> {1, 2, 1} },
     };
 
-    var (successes, failures) = await client.EvaluateBatch("testmod/condfail", new Dictionary<string, Dictionary<string, object>>() {
+    var results = await client.EvaluateBatch<Dictionary<string, object>>("testmod/condfail", new Dictionary<string, object?>() {
       {"AAA", badInput },
       {"BBB", goodInput },
       {"CCC", badInput },
     });
 
-    var expSuccess = new OpaResult()
-    {
-      HttpStatusCode = "200",
-      Result = Result.CreateMapOfAny(
-        new Dictionary<string, object>() {
-          {"p", new Dictionary<string, object>() { { "1", 2 }, { "3", 4 } } }
-        }
-      )
-    };
-    var expError = new OpaError()
-    {
-      Code = "internal_error",
-      DecisionId = null,
-      HttpStatusCode = "500",
-      Message = "object insert conflict"
+    var expectedSuccessValue = new Dictionary<string, object>() {
+      {"p", new Dictionary<string, object>() { { "1", 2 }, { "3", 4 } } }
     };
 
-    // Assert that the failures dictionary has all expected elements, and the
-    // successes dictionary is empty.
-    Assert.Equivalent(new OpaBatchResults() { { "BBB", expSuccess } }, successes);
-    Assert.Equivalent(new Dictionary<string, OpaError>() {
-      { "AAA", expError },
-      { "CCC", expError },
-    }, failures);
+    Assert.True(results["BBB"].IsSuccess);
+    Assert.Equivalent(expectedSuccessValue, results["BBB"].Value);
+    Assert.Equal(200, results["BBB"].StatusCode);
 
+    AssertFailure(results["AAA"], "internal_error", "object insert conflict");
+    Assert.Equal(500, results["AAA"].StatusCode);
+    Assert.Equal(500, results["AAA"].Error!.StatusCode);
+    AssertFailure(results["CCC"], "internal_error", "object insert conflict");
+    Assert.Equal(500, results["CCC"].StatusCode);
   }
 
   [Fact]
@@ -506,28 +490,18 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
       { "y", new List<int> {1, 2, 1} },
     };
 
-    var (successes, failures) = await client.EvaluateBatch("testmod/condfail", new Dictionary<string, Dictionary<string, object>>() {
+    var results = await client.EvaluateBatch<Dictionary<string, object>>("testmod/condfail", new Dictionary<string, object?>() {
       {"AAA", badInput },
       {"BBB", badInput },
       {"CCC", badInput },
     });
 
-    var expError = new OpaError()
+    Assert.Empty(results.Successes());
+    Assert.Equal(3, results.Failures().Count);
+    foreach (var key in new[] { "AAA", "BBB", "CCC" })
     {
-      Code = "internal_error",
-      DecisionId = null,
-      Message = "object insert conflict"
-    };
-
-    // Assert that the failures dictionary has all expected elements, and the
-    // successes dictionary is empty.
-    Assert.Empty(successes);
-    Assert.Equivalent(new Dictionary<string, OpaError>() {
-      { "AAA", expError },
-      { "BBB", expError },
-      { "CCC", expError },
-    }, failures);
-
+      AssertFailure(results[key], "internal_error", "object insert conflict");
+    }
   }
 
   [Fact]
@@ -540,30 +514,22 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
       { "y", new List<int> {1, 1, 1} },
     };
 
-    var (successes, failures) = await client.EvaluateBatch("testmod/condfail", new Dictionary<string, Dictionary<string, object>>() {
+    var results = await client.EvaluateBatch<Dictionary<string, object>>("testmod/condfail", new Dictionary<string, object?>() {
       {"AAA", goodInput },
       {"BBB", goodInput },
       {"CCC", goodInput },
     });
 
-    var expSuccess = new OpaResult()
-    {
-      Result = Result.CreateMapOfAny(
-        new Dictionary<string, object>() {
-          {"p", new Dictionary<string, object>() { { "1", 2 }, { "3", 4 } } }
-        }
-      )
+    var expectedValue = new Dictionary<string, object>() {
+      {"p", new Dictionary<string, object>() { { "1", 2 }, { "3", 4 } } }
     };
 
-    // Assert that the failures dictionary has all expected elements, and the
-    // successes dictionary is empty.
-    Assert.Equivalent(new OpaBatchResults() {
-      { "BBB", expSuccess },
-      { "AAA", expSuccess },
-      { "CCC", expSuccess }
-    }, successes);
-    Assert.Empty(failures);
-
+    foreach (var key in new[] { "AAA", "BBB", "CCC" })
+    {
+      Assert.True(results[key].IsSuccess);
+      Assert.Equivalent(expectedValue, results[key].Value);
+    }
+    Assert.Empty(results.Failures());
   }
 
   [Fact]
@@ -581,37 +547,20 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
       { "y", new List<int> {1, 2, 1} },
     };
 
-    var (successes, failures) = await client.EvaluateBatch("testmod/condfail", new Dictionary<string, Dictionary<string, object>>() {
+    var results = await client.EvaluateBatch<Dictionary<string, object>>("testmod/condfail", new Dictionary<string, object?>() {
       {"AAA", badInput },
       {"BBB", goodInput },
       {"CCC", badInput },
     });
 
-    var expSuccess = new OpaResult()
-    {
-      HttpStatusCode = "200",
-      Result = Result.CreateMapOfAny(
-        new Dictionary<string, object>() {
-          {"p", new Dictionary<string, object>() { { "1", 2 }, { "3", 4 } } }
-        }
-      )
-    };
-    var expError = new OpaError()
-    {
-      Code = "internal_error",
-      DecisionId = null,
-      HttpStatusCode = "500",
-      Message = "error(s) occurred while evaluating query" // Note: different error message for OPA mode.
-    };
+    Assert.True(results["BBB"].IsSuccess);
+    Assert.Equal(200, results["BBB"].StatusCode);
 
-    // Assert that the failures dictionary has all expected elements, and the
-    // successes dictionary is empty.
-    Assert.Equivalent(new OpaBatchResults() { { "BBB", expSuccess } }, successes);
-    Assert.Equivalent(new Dictionary<string, OpaError>() {
-      { "AAA", expError },
-      { "CCC", expError },
-    }, failures);
-
+    // Note: vanilla OPA emits a different message than EOPA for the same condition.
+    AssertFailure(results["AAA"], "internal_error", "error(s) occurred while evaluating query");
+    Assert.Equal(500, results["AAA"].StatusCode);
+    AssertFailure(results["CCC"], "internal_error", "error(s) occurred while evaluating query");
+    Assert.Equal(500, results["CCC"].StatusCode);
   }
 
   [Fact]
@@ -624,244 +573,20 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
       { "y", new List<int> {1, 2, 1} },
     };
 
-    var (successes, failures) = await client.EvaluateBatch("testmod/condfail", new Dictionary<string, Dictionary<string, object>>() {
+    var results = await client.EvaluateBatch<Dictionary<string, object>>("testmod/condfail", new Dictionary<string, object?>() {
       {"AAA", badInput },
       {"BBB", badInput },
       {"CCC", badInput },
     });
 
-    var expError = new OpaError()
+    Assert.Empty(results.Successes());
+    foreach (var key in new[] { "AAA", "BBB", "CCC" })
     {
-      Code = "internal_error",
-      DecisionId = null,
-      Message = "error(s) occurred while evaluating query" // Note: different error message for OPA mode.
-    };
-
-    // Assert that the failures dictionary has all expected elements, and the
-    // successes dictionary is empty.
-    Assert.Empty(successes);
-    Assert.Equivalent(new Dictionary<string, OpaError>() {
-      { "AAA", expError },
-      { "BBB", expError },
-      { "CCC", expError },
-    }, failures);
-
+      AssertFailure(results[key], "internal_error", "error(s) occurred while evaluating query");
+    }
   }
 
-  // The generic version of the batch queries.
-  [Fact]
-  public async Task RBACBatchGenericAllSuccessTest()
-  {
-    var client = GetEOpaClient();
-
-    var goodInput = new Dictionary<string, object>() {
-      { "user", "alice" },
-      { "action", "read" },
-      { "object", "id123" },
-      { "type", "dog" }
-    };
-
-    var (successes, failures) = await client.EvaluateBatch<bool>("app/rbac/allow", new Dictionary<string, Dictionary<string, object>>() {
-      {"AAA", goodInput },
-      {"BBB", goodInput },
-      {"CCC", goodInput },
-    });
-
-    var expSuccess = true;
-
-    // Assert that the successes dictionary has all expected elements, and the
-    // failures dictionary is empty.
-    Assert.Equivalent(new Dictionary<string, object>() {
-      { "AAA", expSuccess },
-      { "BBB", expSuccess },
-      { "CCC", expSuccess },
-    }, successes);
-    Assert.Empty(failures);
-  }
-
-  [Fact]
-  public async Task RBACBatchGenericMixedTest()
-  {
-    var client = GetEOpaClient();
-
-    var goodInput = new Dictionary<string, object>() {
-      { "x", new List<int> {1, 1, 3} },
-      { "y", new List<int> {1, 1, 1} },
-    };
-
-    var badInput = new Dictionary<string, object>() {
-      { "x", new List<int> {1, 1, 3} },
-      { "y", new List<int> {1, 2, 1} },
-    };
-
-    var (successes, failures) = await client.EvaluateBatch<Dictionary<string, object>>("testmod/condfail", new Dictionary<string, Dictionary<string, object>>() {
-      {"AAA", badInput },
-      {"BBB", goodInput },
-      {"CCC", badInput },
-    });
-
-    var expSuccess =
-        new Dictionary<string, object>() {
-          {"p", new Dictionary<string, object>() { { "1", 2 }, { "3", 4 } } }
-        };
-    var expError = new OpaError()
-    {
-      Code = "internal_error",
-      DecisionId = null,
-      HttpStatusCode = "500",
-      Message = "object insert conflict"
-    };
-
-    // Assert that the failures dictionary has all expected elements, and the
-    // successes dictionary is empty.
-    Assert.Equivalent(new OpaBatchResultGeneric<Dictionary<string, object>>() { { "BBB", expSuccess } }, successes);
-    Assert.Equivalent(new Dictionary<string, OpaError>() {
-      { "AAA", expError },
-      { "CCC", expError },
-    }, failures);
-
-  }
-
-  [Fact]
-  public async Task RBACBatchGenericAllFailuresTest()
-  {
-    var client = GetEOpaClient();
-
-    var badInput = new Dictionary<string, object>() {
-      { "x", new List<int> {1, 1, 3} },
-      { "y", new List<int> {1, 2, 1} },
-    };
-
-    var (successes, failures) = await client.EvaluateBatch<Dictionary<string, object>>("testmod/condfail", new Dictionary<string, Dictionary<string, object>>() {
-      {"AAA", badInput },
-      {"BBB", badInput },
-      {"CCC", badInput },
-    });
-
-    var expError = new OpaError()
-    {
-      Code = "internal_error",
-      DecisionId = null,
-      Message = "object insert conflict"
-    };
-
-    // Assert that the failures dictionary has all expected elements, and the
-    // successes dictionary is empty.
-    Assert.Empty(successes);
-    Assert.Equivalent(new Dictionary<string, OpaError>() {
-      { "AAA", expError },
-      { "BBB", expError },
-      { "CCC", expError },
-    }, failures);
-
-  }
-
-  [Fact]
-  public async Task RBACBatchGenericAllSuccessFallbackTest()
-  {
-    var client = GetOpaClient();
-
-    var goodInput = new Dictionary<string, object>() {
-      { "user", "alice" },
-      { "action", "read" },
-      { "object", "id123" },
-      { "type", "dog" }
-    };
-
-    var (successes, failures) = await client.EvaluateBatch<bool>("app/rbac/allow", new Dictionary<string, Dictionary<string, object>>() {
-      {"AAA", goodInput },
-      {"BBB", goodInput },
-      {"CCC", goodInput },
-    });
-
-    var expSuccess = true;
-
-    // Assert that the successes dictionary has all expected elements, and the
-    // failures dictionary is empty.
-    Assert.Equivalent(new Dictionary<string, object>() {
-      { "AAA", expSuccess },
-      { "BBB", expSuccess },
-      { "CCC", expSuccess },
-    }, successes);
-    Assert.Empty(failures);
-  }
-
-  [Fact]
-  public async Task RBACBatchGenericMixedFallbackTest()
-  {
-    var client = GetOpaClient();
-
-    var goodInput = new Dictionary<string, object>() {
-      { "x", new List<int> {1, 1, 3} },
-      { "y", new List<int> {1, 1, 1} },
-    };
-
-    var badInput = new Dictionary<string, object>() {
-      { "x", new List<int> {1, 1, 3} },
-      { "y", new List<int> {1, 2, 1} },
-    };
-
-    var (successes, failures) = await client.EvaluateBatch<Dictionary<string, object>>("testmod/condfail", new Dictionary<string, Dictionary<string, object>>() {
-      {"AAA", badInput },
-      {"BBB", goodInput },
-      {"CCC", badInput },
-    });
-
-    var expSuccess =
-        new Dictionary<string, object>() {
-          {"p", new Dictionary<string, object>() { { "1", 2 }, { "3", 4 } } }
-        };
-    var expError = new OpaError()
-    {
-      Code = "internal_error",
-      DecisionId = null,
-      HttpStatusCode = "500",
-      Message = "error(s) occurred while evaluating query" // Note: different error message for OPA mode.
-    };
-
-    // Assert that the failures dictionary has all expected elements, and the
-    // successes dictionary is empty.
-    Assert.Equivalent(new OpaBatchResultGeneric<Dictionary<string, object>>() { { "BBB", expSuccess } }, successes);
-    Assert.Equivalent(new Dictionary<string, OpaError>() {
-      { "AAA", expError },
-      { "CCC", expError },
-    }, failures);
-
-  }
-
-  [Fact]
-  public async Task RBACBatchGenericAllFailuresFallbackTest()
-  {
-    var client = GetOpaClient();
-
-    var badInput = new Dictionary<string, object>() {
-      { "x", new List<int> {1, 1, 3} },
-      { "y", new List<int> {1, 2, 1} },
-    };
-
-    var (successes, failures) = await client.EvaluateBatch<Dictionary<string, object>>("testmod/condfail", new Dictionary<string, Dictionary<string, object>>() {
-      {"AAA", badInput },
-      {"BBB", badInput },
-      {"CCC", badInput },
-    });
-
-    var expError = new OpaError()
-    {
-      Code = "internal_error",
-      DecisionId = null,
-      Message = "error(s) occurred while evaluating query" // Note: different error message for OPA mode.
-    };
-
-    // Assert that the failures dictionary has all expected elements, and the
-    // successes dictionary is empty.
-    Assert.Empty(successes);
-    Assert.Equivalent(new Dictionary<string, OpaError>() {
-      { "AAA", expError },
-      { "BBB", expError },
-      { "CCC", expError },
-    }, failures);
-
-  }
+  // ---------- compile / data-filter tests ----------
 
   [Fact]
   public async Task GetFiltersTest()
@@ -879,7 +604,6 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
         },
     });
 
-    // Check that the data filters and column masks showed up correctly:
     Assert.Equivalent(new UCASTFilter(
       new UCASTNode(
         type: "compound",
@@ -919,8 +643,6 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
   {
     var client = GetEOpaClient();
 
-    // Result here should be identical to the filters-oriented test, but our
-    // goal here is to make sure column masks are showing up correctly.
     var (_, masks) = await client.GetFilters("filters/include", new Dictionary<string, object>()
     {
         { "user", "bob" },
@@ -932,8 +654,6 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
         },
     });
 
-    // Check that the column masks showed up correctly for the
-    // 'reader' role in the test policy.
     Assert.Equivalent(new Dictionary<string, object>() {
       { "tickets", new Dictionary<string, object>() {
         {"id", new MaskingFunc() { Replace = new() {Value = "***"} } },
@@ -956,14 +676,13 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
             }
         },
     }, targetDialects: [
-      OpenPolicyAgent.Opa.Filters.TargetDialects.SqlPostgresql,
-        OpenPolicyAgent.Opa.Filters.TargetDialects.SqlMysql,
-        OpenPolicyAgent.Opa.Filters.TargetDialects.SqlSqlserver,
-        OpenPolicyAgent.Opa.Filters.TargetDialects.SqlSqlite,
-        OpenPolicyAgent.Opa.Filters.TargetDialects.UcastPrisma,
+      TargetDialects.SqlPostgresql,
+      TargetDialects.SqlMysql,
+      TargetDialects.SqlSqlserver,
+      TargetDialects.SqlSqlite,
+      TargetDialects.UcastPrisma,
     ]);
 
-    // Check that the data filters and column masks showed up correctly:
     Assert.Equivalent(new UCASTFilter(
       new UCASTNode(
         type: "compound",
@@ -1011,8 +730,6 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
   {
     var client = GetEOpaClient();
 
-    // Result here should be identical to the filters-oriented test, but our
-    // goal here is to make sure column masks are showing up correctly.
     var (_, masks) = await client.GetMultipleFilters("filters/include", new Dictionary<string, object>()
     {
         { "user", "bob" },
@@ -1023,21 +740,21 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
             }
         },
     }, targetDialects: [
-      OpenPolicyAgent.Opa.Filters.TargetDialects.SqlPostgresql,
-        OpenPolicyAgent.Opa.Filters.TargetDialects.SqlMysql,
-        OpenPolicyAgent.Opa.Filters.TargetDialects.SqlSqlserver,
-        OpenPolicyAgent.Opa.Filters.TargetDialects.SqlSqlite,
-        OpenPolicyAgent.Opa.Filters.TargetDialects.UcastPrisma,
+      TargetDialects.SqlPostgresql,
+      TargetDialects.SqlMysql,
+      TargetDialects.SqlSqlserver,
+      TargetDialects.SqlSqlite,
+      TargetDialects.UcastPrisma,
     ]);
 
-    // Check that the column masks showed up correctly for the
-    // 'reader' role in the test policy.
     Assert.Equivalent(new Dictionary<string, object>() {
       { "tickets", new Dictionary<string, object>() {
         {"id", new MaskingFunc() { Replace = new() {Value = "***"} } },
       }},
     }, masks);
   }
+
+  // ---------- logging behavior ----------
 
   [Fact]
   public async Task LogsExistTest()
@@ -1056,11 +773,85 @@ public class HighLevelTest : IClassFixture<OPAContainerFixture>, IClassFixture<E
     }
     catch (OpaException e)
     {
-      // Do nothing.
       _testOutput.WriteLine(e.Message);
     }
 
     Assert.Single(logger.Logs);
     Assert.Contains("executing policy 'testmod/condfail' failed with exception: ", logger.Logs[0]);
+  }
+
+  // ---------- new ctor parameters: serializer, httpClient, bearerTokenSource ----------
+
+  [Fact]
+  public async Task SerializerSwapNewtonsoftAndStjProduceEquivalentResultsTest()
+  {
+    var input = new Dictionary<string, object>() {
+      { "user", "alice" },
+      { "action", "read" },
+      { "object", "id123" },
+      { "type", "dog" },
+    };
+
+    var newtonsoftClient = new OpaClient(serverUrl: OpaUrl(), serializer: new NewtonsoftOpaSerializer());
+    var stjClient = new OpaClient(serverUrl: OpaUrl(), serializer: new SystemTextJsonOpaSerializer());
+
+    var nsAllow = await newtonsoftClient.Check("app/rbac/allow", input);
+    var stjAllow = await stjClient.Check("app/rbac/allow", input);
+
+    Assert.True(nsAllow);
+    Assert.True(stjAllow);
+    Assert.Equal(nsAllow, stjAllow);
+  }
+
+  [Fact]
+  public async Task BearerTokenSourceIsCalledPerRequestTest()
+  {
+    int calls = 0;
+    string TokenSource()
+    {
+      calls++;
+      return $"token-{calls}";
+    }
+
+    var client = new OpaClient(serverUrl: OpaUrl(), bearerTokenSource: TokenSource);
+
+    // OPA happily ignores Authorization headers it doesn't require; the policy
+    // should still evaluate normally. This test verifies the SDK invokes the
+    // token source for each request without breaking the request flow.
+    await client.Check("app/rbac/allow", new Dictionary<string, object>() {
+      { "user", "alice" }, { "action", "read" }, { "object", "id123" }, { "type", "dog" }
+    });
+    await client.Check("app/rbac/allow", new Dictionary<string, object>() {
+      { "user", "alice" }, { "action", "read" }, { "object", "id123" }, { "type", "dog" }
+    });
+
+    Assert.Equal(2, calls);
+  }
+
+  [Fact]
+  public async Task CustomHttpClientIsUsedTest()
+  {
+    var observed = new List<string>();
+    var handler = new ObservingHandler(observed);
+    using var http = new HttpClient(handler);
+
+    var client = new OpaClient(serverUrl: OpaUrl(), httpClient: http);
+    await client.Check("app/rbac/allow", new Dictionary<string, object>() {
+      { "user", "alice" }, { "action", "read" }, { "object", "id123" }, { "type", "dog" }
+    });
+
+    Assert.NotEmpty(observed);
+    Assert.Contains(observed, u => u.Contains("/v1/data/app/rbac/allow"));
+  }
+
+  private sealed class ObservingHandler : DelegatingHandler
+  {
+    private readonly List<string> _seen;
+    public ObservingHandler(List<string> seen) : base(new HttpClientHandler()) { _seen = seen; }
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+      _seen.Add(request.RequestUri?.ToString() ?? "");
+      return base.SendAsync(request, cancellationToken);
+    }
   }
 }

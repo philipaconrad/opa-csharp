@@ -16,23 +16,6 @@ concurrency:
 
 
 jobs:
-  docs-updates-needed:
-    name: Docs Update Check
-    runs-on: ubuntu-latest
-    steps:
-      - name: Tune GitHub-hosted runner network
-        uses: smorimoto/tune-github-hosted-runner-network@bb252dcb5c8609a31087e7993daa086f5a1c0069 # v1.0.0
-
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Patch Speakeasy README docs links
-        run: ./scripts/patch-readme.sh README.md http://localhost:8000
-
-      - name: Check for any unpatched docs links
-        run: ./scripts/find-unpatched-links.sh README.md
-
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -76,8 +59,6 @@ jobs:
 
       - name: Test
         run: dotnet test
-        env:
-          EOPA_LICENSE_TOKEN: ${{ secrets.EOPA_LICENSE_TOKEN }}
         timeout-minutes: 5
 
   gh-actions-lint:

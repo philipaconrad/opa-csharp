@@ -1,65 +1,40 @@
-﻿using Newtonsoft.Json;
+using Newtonsoft.Json;
+using STJ = System.Text.Json.Serialization;
 
 namespace OpenPolicyAgent.Opa;
 
-public class OpaError
+/// <summary>
+/// Per-input failure details surfaced by <see cref="OpaClient"/> through
+/// <see cref="OpaBatchEntry{T}.Error"/> or
+/// <see cref="OpaServerException.BatchQueryErrors"/>. For uniform 4xx/5xx
+/// failures of an entire request, see <see cref="OpaPolicyException"/> /
+/// <see cref="OpaServerException"/> instead.
+/// </summary>
+public sealed class OpaError
 {
-    /// <summary>
-    /// The short-form category of error, such as "internal_error", "invalid_policy_or_data", etc.
-    /// </summary>
+    /// <summary>OPA short-form error code, e.g. "internal_error", "invalid_parameter".</summary>
     [JsonProperty("code")]
+    [STJ.JsonPropertyName("code")]
     public string Code { get; set; } = default!;
 
-    /// <summary>
-    /// If decision logging is enabled, this field contains a string that uniquely identifies the decision. The identifier will be included in the decision log event for this decision. Callers can use the identifier for correlation purposes.
-    /// </summary>
-    [JsonProperty("decision_id")]
-    public string? DecisionId { get; set; }
-
-    /// <summary>
-    /// The long-form error message from the OPA instance, describing what went wrong.
-    /// </summary>
+    /// <summary>Long-form error message returned by OPA.</summary>
     [JsonProperty("message")]
+    [STJ.JsonPropertyName("message")]
     public string Message { get; set; } = default!;
 
-    /// <summary>
-    /// The HTTP status code for the request. Limited to "200" or "500".
-    /// </summary>
-    [JsonProperty("http_status_code")]
-    public string? HttpStatusCode { get; set; }
+    /// <summary>Decision identifier supplied by OPA when decision logging is enabled.</summary>
+    [JsonProperty("decision_id", NullValueHandling = NullValueHandling.Ignore)]
+    [STJ.JsonPropertyName("decision_id")]
+    [STJ.JsonIgnore(Condition = STJ.JsonIgnoreCondition.WhenWritingNull)]
+    public string? DecisionId { get; set; }
 
-    public OpaError()
-    {
+    /// <summary>HTTP status code associated with this error. Typically 500 for server-side, 400 for client-side; null when not applicable (e.g. all-failures fallback path).</summary>
+    [JsonProperty("status_code", NullValueHandling = NullValueHandling.Ignore)]
+    [STJ.JsonPropertyName("status_code")]
+    [STJ.JsonIgnore(Condition = STJ.JsonIgnoreCondition.WhenWritingNull)]
+    public int? StatusCode { get; set; }
 
-    }
+    public OpaError() { }
 
-    public OpaError(OpenPolicyAgent.Opa.OpenApi.Models.Components.ServerErrorWithStatusCode err)
-    {
-        Code = err.Code;
-        DecisionId = err.DecisionId;
-        Message = err.Message;
-        HttpStatusCode = err.HttpStatusCode;
-    }
-
-    public OpaError(OpenPolicyAgent.Opa.OpenApi.Models.Components.ServerError err)
-    {
-        Code = err.Code;
-        DecisionId = err.DecisionId;
-        Message = err.Message;
-    }
-
-    public OpaError(OpenPolicyAgent.Opa.OpenApi.Models.Errors.ServerError err)
-    {
-        Code = err.Code;
-        DecisionId = err.DecisionId;
-        Message = err.Message;
-    }
-
-    public static explicit operator OpaError(OpenApi.Models.Components.ServerErrorWithStatusCode e) => new(e);
-    public static explicit operator OpaError(OpenApi.Models.Errors.ServerError e) => new(e);
-
-    public override string ToString()
-    {
-        return JsonConvert.SerializeObject(this);
-    }
+    public override string ToString() => JsonConvert.SerializeObject(this);
 }
